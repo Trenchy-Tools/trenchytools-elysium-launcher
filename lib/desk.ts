@@ -6,18 +6,19 @@
  */
 import { formatEther, parseEther, type Address, type Hex } from "viem"
 import { Nonces, signTx, waitSuccess } from "./core/evm"
-import { DESK_BYTECODE, DESK_DEPLOY_GAS, deskOf, deskView, deskWithdrawHypeData, deskWithdrawTokenData, rememberDesk, verifyDesk, type DeskView } from "./elysium/desk"
+import { DESK_BYTECODE, DESK_DEPLOY_GAS, DESK_VERSION, deskOf, deskVersion, deskView, deskWithdrawHypeData, deskWithdrawTokenData, rememberDesk, rememberDeskVersion, verifyDesk, type DeskView } from "./elysium/desk"
 import { TRANSFER_GAS } from "./elysium/chain"
 import { chainApi } from "./settings"
 import { accountOf, assertBackedUp } from "./wallets"
 
-export type DeskStatus = { publicKey: string; desk: Address | null; hype?: string; token?: string | null; tokens?: string }
+/** `version`: 2 trades Ascend's WHYPE pools AND the native-HYPE pools of Montra / BOXA; 1 (deployed before 11/5 PM) Ascend only. */
+export type DeskStatus = { publicKey: string; desk: Address | null; version?: number; latest: number; hype?: string; token?: string | null; tokens?: string }
 
 export async function deskStatus(publicKey: string, token?: string | null): Promise<DeskStatus> {
   const desk = await verifyDesk(publicKey)
-  if (!desk) return { publicKey, desk: null }
-  const v: DeskView = await deskView(desk, (token as Address) ?? null)
-  return { publicKey, desk, hype: formatEther(v.hypeWei), token: token ?? null, tokens: formatEther(v.tokenWei) }
+  if (!desk) return { publicKey, desk: null, latest: DESK_VERSION }
+  const [v, version] = await Promise.all([deskView(desk, (token as Address) ?? null), deskVersion(desk)])
+  return { publicKey, desk, version, latest: DESK_VERSION, hype: formatEther(v.hypeWei), token: token ?? null, tokens: formatEther(v.tokenWei) }
 }
 
 async function send(publicKey: string, tx: { to?: Address; data: Hex; value: bigint; gas: bigint }, what: string): Promise<Hex> {
@@ -30,10 +31,10 @@ async function send(publicKey: string, tx: { to?: Address; data: Hex; value: big
   return hash as Hex
 }
 
-/** Deploy a desk owned by the wallet (one per wallet; an existing one is returned). */
-export async function deployDesk(publicKey: string): Promise<{ desk: Address; hash?: string }> {
-  const existing = await verifyDesk(publicKey)
-  if (existing) return { desk: existing }
+/** Deploy a desk owned by the wallet (one per wallet; an existing one is returned unless `replace`). New desks are v2. */
+export async function deployDesk(publicKey: string, opts: { replace?: boolean } = {}): Promise<{ desk: Address; hash?: string; version: number }> {
+  const existing = opts.replace ? null : await verifyDesk(publicKey)
+  if (existing) return { desk: existing, version: await deskVersion(existing) }
   assertBackedUp(publicKey)
   const api = chainApi()
   const acct = await api.rh.account(publicKey)
@@ -45,7 +46,24 @@ export async function deployDesk(publicKey: string): Promise<{ desk: Address; ha
   const receipt = await (await import("./elysium/chain")).publicClient().getTransactionReceipt({ hash: hash as Hex })
   if (r.status !== "success" || !receipt.contractAddress) throw new Error(`desk deploy reverted: ${hash}`)
   rememberDesk(publicKey, receipt.contractAddress)
-  return { desk: receipt.contractAddress, hash }
+  rememberDeskVersion(receipt.contractAddress, DESK_VERSION)
+  return { desk: receipt.contractAddress, hash, version: DESK_VERSION }
+}
+
+/**
+ * Replace a v1 desk with a v2 one (needed to trade Montra / BOXA coins through it): its HYPE comes back to the wallet
+ * first (a coin still inside stays in the old desk — withdraw it from the Desk card before upgrading), then the new
+ * desk is deployed and remembered. A desk that is already v2 is returned as is.
+ */
+export async function upgradeDesk(publicKey: string): Promise<{ desk: Address; hash?: string; version: number; upgraded: boolean }> {
+  const old = await verifyDesk(publicKey)
+  if (old && (await deskVersion(old)) >= DESK_VERSION) return { desk: old, version: DESK_VERSION, upgraded: false }
+  if (old) {
+    const hype = (await deskView(old)).hypeWei
+    if (hype > 0n) await send(publicKey, { to: old, data: deskWithdrawHypeData(publicKey as Address, 0n), value: 0n, gas: 80_000n }, "withdraw before upgrade")
+  }
+  const r = await deployDesk(publicKey, { replace: true })
+  return { ...r, upgraded: true }
 }
 
 export async function fundDesk(publicKey: string, hype: number): Promise<{ desk: Address; hash: string }> {

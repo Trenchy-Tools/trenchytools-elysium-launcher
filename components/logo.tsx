@@ -1,4 +1,5 @@
 import { cn } from "@/lib/utils"
+import { BRAND } from "@/lib/brand"
 
 /**
  * The trenchytools mark: a T that is also a shovel (digging in the trenches), with a pixel breaking off the handle.
@@ -31,7 +32,7 @@ export function Logo({ className }: { className?: string }) {
     <span className={cn("inline-flex items-center gap-2", className)}>
       <LogoMark className="h-[22px]" />
       <Wordmark className="h-[22px]" />
-      <span className="text-muted-foreground text-[0.95em] font-normal">elysium starter</span>
+      <span className="text-muted-foreground text-[0.95em] font-normal">{BRAND.tag}</span>
     </span>
   )
 }

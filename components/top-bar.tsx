@@ -9,6 +9,7 @@ import { SettingsSheet } from "./settings-sheet"
 import { ThemeToggle } from "./theme-toggle"
 import { useStatus } from "./providers"
 import { cn } from "@/lib/utils"
+import { BRAND } from "@/lib/brand"
 
 const NAV = [
   { href: "/launch", label: "Launch" },
@@ -16,7 +17,7 @@ const NAV = [
   { href: "/wallets", label: "Wallets" },
 ]
 const LIVE = "https://elysium.trenchy.tools"
-const REPO = "https://github.com/Trenchy-Tools/trenchytools-elysium-launcher"
+const REPO = BRAND.repo
 
 /**
  * Seven targets: wordmark · Launch · Trading · Wallets · one status dot (opens Settings) · Get an API key · ⋯ menu
@@ -33,7 +34,7 @@ export function TopBar() {
   return (
     <header className="bg-background/80 sticky top-0 z-40 border-b backdrop-blur-md">
       <div className="flex h-14 w-full items-center gap-6 px-5 sm:px-6">
-        <Link href="/launch" aria-label="TrenchyTools elysium starter" className="flex text-[17px]"><Logo /></Link>
+        <Link href="/launch" aria-label={`TrenchyTools ${BRAND.tag}`} className="flex text-[17px]"><Logo /></Link>
         <nav className="flex items-center gap-1 text-sm">
           {NAV.map((n) => (
             <Link key={n.href} href={n.href} className={cn("rounded-md px-2.5 py-1.5 transition-colors", path.startsWith(n.href) ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground")}>

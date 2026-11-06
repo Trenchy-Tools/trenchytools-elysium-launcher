@@ -2,6 +2,21 @@
  * What differs on the shared pages: the chain's name, its native coin, how addresses look, where things are seen,
  * and which extras exist. Client-safe (no node imports).
  */
+import { padToken } from "./links"
+
+/** The launchpads this app launches and trades on. Ascend quotes WHYPE; Montra and BOXA are native-HYPE pools. */
+export type ElysiumPad = "montra" | "boxa"
+export type Launchpad = "ascend" | ElysiumPad
+export const LAUNCHPADS: readonly Launchpad[] = ["ascend", "montra", "boxa"]
+export const LAUNCHPAD_NAMES: Record<Launchpad, string> = { ascend: "Ascend", montra: "Montra", boxa: "BOXA" }
+export const isLaunchpad = (s: unknown): s is Launchpad => typeof s === "string" && (LAUNCHPADS as readonly string[]).includes(s)
+/** One line per pad for the Launch page's picker. */
+export const LAUNCHPAD_BLURB: Record<Launchpad, string> = {
+  ascend: "Uniswap V4 vs WHYPE · trade fee 1–10 % (above 1 % is yours) · dev bag straight into your desk",
+  montra: "native-HYPE Uniswap V4 · the hook's default fee · the busiest pad (≈1,600 coins)",
+  boxa: "native-HYPE Uniswap V4 · optional extra fee 0–5 % on top of the hook's · creator fees via the hook",
+}
+
 export type ChainConfig = {
   name: string
   symbol: string
@@ -16,7 +31,8 @@ export type ChainConfig = {
   fmt: (n: number | null | undefined) => string
   explorerAddress: (address: string) => string
   explorerTx: (sig: string) => string
-  coinLinks: (coin: string) => Array<{ label: string; href: string }>
+  /** `venue`: which launchpad's pool the coin trades on (ascend when unknown) */
+  coinLinks: (coin: string, venue?: string) => Array<{ label: string; href: string }>
   /** an embeddable candle chart, or null when the chain has none */
   chartUrl: (coin: string, theme: "dark" | "light") => string | null
   /** the launch-log stream of this app, and one entry of it read into a common shape */
@@ -44,8 +60,8 @@ export const chain: ChainConfig = {
   fmt: (n) => (n === null || n === undefined ? "–" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 5 })),
   explorerAddress: (a) => `${EXPLORER}/address/${a}`,
   explorerTx: (hash) => `${EXPLORER}/tx/${hash}`,
-  coinLinks: (token) => [
-    { label: "ascend", href: `https://app.ascendlaunch.xyz/tokens/${token.toLowerCase()}` },
+  coinLinks: (token, venue) => [
+    { label: isLaunchpad(venue) ? venue : "ascend", href: padToken(isLaunchpad(venue) ? venue : "ascend", token) },
     { label: "elyscan", href: `${EXPLORER}/token/${token}` },
   ],
   // no embeddable chart for Elysium yet; the Ascend page has one

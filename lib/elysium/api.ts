@@ -18,16 +18,19 @@
  * A wallet with a desk (lib/elysium/desk.ts) buys through it when the desk holds enough HYPE and sells through it
  * when the coin sits there: one call, nothing to approve. Otherwise the UniversalRouter, with the approvals first.
  */
-import { formatEther, parseEther, type Address, type Hex } from "viem"
-import { ADDR, ELYSIUM_CHAIN_ID, publicClient, sendRaw, simulateSequence, TRANSFER_GAS } from "./chain"
+import { encodeFunctionData, formatEther, parseEther, type Address, type Hex } from "viem"
+import { ADDR, ELYSIUM_CHAIN_ID, publicClient, sendRaw, simulateNativeReceived, simulateSequence, TRANSFER_GAS } from "./chain"
 import { ApiError } from "../core/errors"
 import { APPROVE_GAS, BUY_GAS, ERC20_ABI, SELL_GAS, ascendKey, poolIdOf, quote as v4Quote, sellApprovals, buyCall, sellCall } from "./v4"
 import { LAUNCH_GAS, approveWhypeCalldata, claimCalldata, decodeLaunchReceipt, feeView, launchCalldata, pickStartTick, tokenInfo, wrapCalldata, WETH9_ABI, type LaunchParams } from "./ascend"
-import { DESK_BUY_GAS, DESK_SELL_GAS, deskBuyData, deskHolding, deskOf, deskSellData } from "./desk"
+import { DESK_BUY_GAS, DESK_SELL_GAS, deskBuyData, deskHolding, deskOf, deskSellData, deskSupports } from "./desk"
+import { isLaunchpad, LAUNCHPAD_NAMES, padBuyCall, padClaimCalldata, padFees, padQuote, padSellApprovals, padSellCall, PAD_SWAP_GAS, resolveVenue, seedPadVenue, type Launchpad, type Venue, type VenueHit } from "./pads"
+import { buildBoxaLaunch, buildMontraLaunch, decodePadLaunchReceipt, launchPredictedToken, montraMetadataJson, padName } from "./pad-launch"
 import { swapsOf, launchBlockOf } from "./tape"
 import { pinBuffer, pinMetadata, type Metadata } from "./pin"
 
 export { ApiError }
+export type { Launchpad, Venue }
 
 export type TxLabel = "approve" | "buy" | "sell" | "create" | "wrap" | "fee" | "transfer" | "deposit" | "sweep" | "claim"
 export type EvmTx = { chainId: number; from: string; to: string; data: string; value: string; valueEth?: string; gas?: string; label: TxLabel }
@@ -41,16 +44,22 @@ export type TradeBody = {
   denominatedInEth?: "true" | "false"
   slippage?: number
   tokenMetadata?: TokenMetadata
-  /** create: the pool's trade fee in hundredths of a bip (10000 = 1 %); the pinned metadata URI for the calldata suffix */
+  /** create: where to launch (Ascend when absent) */
+  launchpad?: Launchpad
+  /** create on Ascend: the pool's trade fee in hundredths of a bip (10000 = 1 %); the pinned metadata URI for the calldata suffix */
   feePpm?: number
   metadataUri?: string | null
+  /** create on BOXA: the EXTRA fee on top of the hook's own cut, in bps (0–500) */
+  feeBps?: number
 }
-export type Built = { chainId: number; transactions: EvmTx[]; expected: Expected; venue: "v4" | "desk" | "launch"; predicted?: { token?: string; escrow?: string; devReceiver?: string }; launchFeeEth?: number }
+/** `venue` is the execution path; `market` which launchpad's pool it is. */
+export type Built = { chainId: number; transactions: EvmTx[]; expected: Expected; venue: "v4" | "desk" | "launch"; market?: Venue; predicted?: { token?: string; escrow?: string; devReceiver?: string }; launchFeeEth?: number }
 export type TxStatus = { hash: string; status: "success" | "reverted" | "pending_or_unknown"; block?: number; gasUsed?: string; logs?: Array<{ address: Address; topics: readonly Hex[]; data: Hex }> }
 export type Simulation = { ok: boolean; steps: Array<{ label: string; ok: boolean; gasUsed: string | null; error: string | null }> }
 export type Quote = { venue: string; action: "buy" | "sell"; ethIn?: number; tokensOut?: number; tokensIn?: number; ethOut?: number }
-export type TokenInfo = { token: string; name: string; symbol: string; venue: "uniswap-v4"; poolId: string; hasPool: boolean; creator: string; totalSupply: number }
-export type CreatorFees = { wallet: string; escrow: string; claimableWei: string; claimableEth: number; eth: number; heldEth: number; deadline: number; feePpm: number }
+export type TokenInfo = { token: string; name: string; symbol: string; venue: Venue | "none"; poolId: string; hasPool: boolean; creator: string; totalSupply: number }
+/** `escrow` is whatever pays: Ascend's CreatorEscrow, or the pad's hook. `heldEth` / `deadline` are Ascend's graduation hold (0 on the pads). */
+export type CreatorFees = { wallet: string; venue: Venue; escrow: string; claimableWei: string; claimableEth: number; eth: number; heldEth: number; deadline: number; feePpm: number }
 export type AccountData = { wallet: string; chainId: number; nonce: number; pendingNonce: number; balanceEth: string; block: number; gasPrice: string; maxFeePerGas: string; maxPriorityFeePerGas: string; transferGas: string }
 export type ApiCall = { method: string; path: string; status: number; ms: number; note?: string; error?: string }
 
@@ -120,32 +129,47 @@ export class ElysiumApi {
     },
 
     quote: (p: { token: string; action: "buy" | "sell"; amount: number; wallet?: string }): Promise<Quote> => this.step("GET", `quote ${p.action} ${p.amount}`, async () => {
-      const amountIn = parseEther(String(p.amount) as `${number}`)
-      const out = await v4Quote(p.token as Address, p.action, amountIn)
-      if (out === null) throw new ApiError("No Ascend pool answers for this coin (not launched there, or the hook refused)", 404, "no_pool")
-      return p.action === "buy" ? { venue: "uniswap-v4", action: "buy", ethIn: p.amount, tokensOut: Number(formatEther(out)) } : { venue: "uniswap-v4", action: "sell", tokensIn: p.amount, ethOut: Number(formatEther(out)) }
+      const token = p.token as Address
+      const hit = await this.venueOr404(token)
+      const amount = parseEther(String(p.amount) as `${number}`)
+      let out = await this.quoteOn(hit, token, p.action, amount)
+      // Montra / BOXA hooks refuse sell quotes: a wallet that holds the coin gets its own sell simulated instead
+      if (out === null && p.action === "sell" && hit.venue !== "ascend" && p.wallet) out = await this.padSellBySimulation(hit, token, p.wallet as Address, amount)
+      if (out === null) {
+        if (p.action === "sell" && hit.venue !== "ascend") throw new ApiError(`${LAUNCHPAD_NAMES[hit.venue]}'s hook refuses sell quotes from the V4 Quoter; pass a wallet that holds at least this many tokens and its own sell is simulated instead`, 404, "no_quote")
+        throw new ApiError(`${LAUNCHPAD_NAMES[hit.venue]}'s pool refused the quote for this coin (the hook refused, or the size is more than the pool holds)`, 404, "no_pool")
+      }
+      return p.action === "buy" ? { venue: hit.venue, action: "buy", ethIn: p.amount, tokensOut: Number(formatEther(out)) } : { venue: hit.venue, action: "sell", tokensIn: p.amount, ethOut: Number(formatEther(out)) }
     }),
 
     token: (token: string): Promise<TokenInfo> => this.step("GET", `token ${token.slice(0, 10)}`, async () => {
-      const i = await tokenInfo(token as Address)
+      const [i, hit] = await Promise.all([tokenInfo(token as Address), resolveVenue(token as Address).catch(() => null)])
       let creator = ""
-      try { const fv = await feeView(token as Address, ADDR.escrowFactory); creator = fv.recipient } catch { /* no escrow */ }
-      return { token, name: i.name, symbol: i.symbol, venue: "uniswap-v4", poolId: i.poolId, hasPool: i.hasPool, creator, totalSupply: Number(formatEther(i.totalSupply)) }
+      if (hit?.venue === "ascend") { try { const fv = await feeView(token as Address, ADDR.escrowFactory); creator = fv.recipient } catch { /* no escrow */ } }
+      return { token, name: i.name, symbol: i.symbol, venue: hit?.venue ?? "none", poolId: hit?.poolId ?? i.poolId, hasPool: hit !== null, creator, totalSupply: Number(formatEther(i.totalSupply)) }
     }),
 
     tradeHistory: async (token: string, limit = 100) => {
-      const launch = await launchBlockOf(token as Address)
+      const [launch, hit] = await Promise.all([launchBlockOf(token as Address), resolveVenue(token as Address).catch(() => null)])
       const head = await publicClient().getBlockNumber()
       const from = launch ?? (head > 20_000n ? head - 20_000n : 0n)
       const swaps = await swapsOf(token as Address, from)
-      const trades = swaps.slice(-limit).reverse().map((s) => ({ hash: s.hash, token, txType: s.type, trader: s.trader, ethAmount: s.hype, tokenAmount: s.tokens, ts: s.timestamp, venue: "uniswap-v4", block: s.block }))
+      const venue = hit?.venue ?? "uniswap-v4"
+      const trades = swaps.slice(-limit).reverse().map((s) => ({ hash: s.hash, token, txType: s.type, trader: s.trader, ethAmount: s.hype, tokenAmount: s.tokens, ts: s.timestamp, venue, block: s.block }))
       return { token, curve: "", launchBlock: Number(launch ?? 0n), trades }
     },
 
+    /** What `wallet` can claim as the coin's creator: Ascend's escrow (claimable + the graduation hold), or the pad's hook. */
     creatorFees: (wallet: string, token?: string): Promise<CreatorFees> => this.step("GET", `fees ${wallet.slice(0, 10)}`, async () => {
       if (!token) throw new ApiError("token is required", 400, "bad_request")
-      const f = await feeView(token as Address, wallet as Address)
-      return { wallet, escrow: f.escrow, claimableWei: str(f.claimableWei), claimableEth: Number(formatEther(f.claimableWei)), eth: Number(formatEther(f.claimableWei)), heldEth: Number(formatEther(f.heldWei)), deadline: f.deadline, feePpm: f.feePpm }
+      const hit = await this.venueOr404(token as Address)
+      if (hit.venue === "ascend") {
+        const f = await feeView(token as Address, wallet as Address)
+        return { wallet, venue: "ascend", escrow: f.escrow, claimableWei: str(f.claimableWei), claimableEth: Number(formatEther(f.claimableWei)), eth: Number(formatEther(f.claimableWei)), heldEth: Number(formatEther(f.heldWei)), deadline: f.deadline, feePpm: f.feePpm }
+      }
+      const f = await padFees(hit, wallet as Address)
+      const eth = Number(formatEther(f.claimableWei))
+      return { wallet, venue: hit.venue, escrow: f.payer, claimableWei: str(f.claimableWei), claimableEth: eth, eth, heldEth: 0, deadline: 0, feePpm: 0 }
     }),
 
     ethBalances: async (wallets: string[]): Promise<Map<string, number>> => {
@@ -195,6 +219,24 @@ export class ElysiumApi {
     return { metadataUri, metadata: { image: image.uri } }
   }
 
+  // ── the venue seam ──────────────────────────────────────────────────────────
+
+  /** Which market the coin trades on (Ascend, Montra or BOXA), or a clean 404. Cached after the first resolve. */
+  private async venueOr404(token: Address): Promise<VenueHit> {
+    const hit = await resolveVenue(token)
+    if (!hit) throw new ApiError("No market found for this coin on Ascend, Montra or BOXA (not launched on one of them, or the launch is not mined yet)", 404, "no_pool")
+    return hit
+  }
+  private quoteOn(hit: VenueHit, token: Address, action: "buy" | "sell", amount: bigint): Promise<bigint | null> {
+    return hit.venue === "ascend" ? v4Quote(token, action, amount) : padQuote(hit, action, amount)
+  }
+  /** A pad sell's HYPE out, by simulating the wallet's own approvals + router sell (the hooks refuse the quoter on sells). */
+  private async padSellBySimulation(hit: VenueHit, token: Address, wallet: Address, amount: bigint): Promise<bigint | null> {
+    const approvals = await padSellApprovals(wallet, token).catch(() => null)
+    if (!approvals) return null
+    return simulateNativeReceived([...approvals, padSellCall(hit, amount, 0n)].map((c) => ({ from: wallet, ...c })), [wallet]).catch(() => null)
+  }
+
   // ── building transactions ───────────────────────────────────────────────────
 
   private async build(b: TradeBody): Promise<Built> {
@@ -204,80 +246,148 @@ export class ElysiumApi {
 
     if (b.action === "buy") {
       const token = b.token as Address
+      const hit = await this.venueOr404(token)
       const hypeIn = parseEther(String(b.amount) as `${number}`)
+      // the desk, when the wallet has one that can trade this pool (a pad coin needs a v2 desk) and it holds enough HYPE
       const dh = await deskHolding(wallet, token)
-      const deskHype = dh ? await publicClient().getBalance({ address: dh.desk }) : 0n
-      const quoted = (await v4Quote(token, "buy", hypeIn)) ?? 0n
+      const deskOk = dh ? await deskSupports(dh.desk, token) : false
+      const deskHype = dh && deskOk ? await publicClient().getBalance({ address: dh.desk }) : 0n
+      const quoted = (await this.quoteOn(hit, token, "buy", hypeIn)) ?? 0n
       const expected = { tokens: Number(formatEther(quoted)), eth: Number(formatEther(hypeIn)) }
-      if (dh && deskHype >= hypeIn) return { chainId: ELYSIUM_CHAIN_ID, venue: "desk", expected, transactions: [tx({ to: dh.desk, data: deskBuyData(token, hypeIn, slip(quoted)), value: 0n }, "buy", DESK_BUY_GAS)] }
-      return { chainId: ELYSIUM_CHAIN_ID, venue: "v4", expected, transactions: [tx(buyCall(token, hypeIn, slip(quoted)), "buy", BUY_GAS)] }
+      if (dh && deskOk && deskHype >= hypeIn) return { chainId: ELYSIUM_CHAIN_ID, venue: "desk", market: hit.venue, expected, transactions: [tx({ to: dh.desk, data: deskBuyData(token, hypeIn, slip(quoted)), value: 0n }, "buy", DESK_BUY_GAS)] }
+      const call = hit.venue === "ascend" ? buyCall(token, hypeIn, slip(quoted)) : padBuyCall(hit, hypeIn, slip(quoted))
+      return { chainId: ELYSIUM_CHAIN_ID, venue: "v4", market: hit.venue, expected, transactions: [tx(call, "buy", hit.venue === "ascend" ? BUY_GAS : PAD_SWAP_GAS)] }
     }
 
     if (b.action === "sell") {
       const token = b.token as Address
+      const hit = await this.venueOr404(token)
       const c = publicClient()
       const dh = await deskHolding(wallet, token)
+      const deskOk = dh ? await deskSupports(dh.desk, token) : false
       const own = await c.readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [wallet] })
       const pct = typeof b.amount === "string" && b.amount.endsWith("%") ? Math.max(1, Math.min(100, Number(b.amount.slice(0, -1)) || 100)) : 100
       const txs: EvmTx[] = []
       let ethOut = 0n, tokensIn = 0n
       // the desk's bag first (one call, nothing to approve), then whatever the wallet itself holds
-      if (dh && dh.held > 0n) {
+      if (dh && dh.held > 0n && deskOk) {
         const part = pct >= 100 ? 0n : (dh.held * BigInt(pct)) / 100n
-        const q = (await v4Quote(token, "sell", part || dh.held)) ?? 0n
+        let q = await this.quoteOn(hit, token, "sell", part || dh.held)
+        // a pad pool refuses the quoter on sells: simulate the desk's own sell and read the HYPE it pays out
+        if (q === null && hit.venue !== "ascend") q = await simulateNativeReceived([{ from: wallet, to: dh.desk, data: deskSellData(token, part, 0n), value: 0n }], [dh.desk, wallet]).catch(() => null)
+        q ??= 0n
         txs.push(tx({ to: dh.desk, data: deskSellData(token, part, slip(q)), value: 0n }, "sell", DESK_SELL_GAS))
         ethOut += q; tokensIn += part || dh.held
       }
       if (own > 0n) {
         const part = (own * BigInt(pct)) / 100n
         if (part > 0n) {
-          for (const a of await sellApprovals(wallet, token)) txs.push(tx(a, "approve", APPROVE_GAS))
-          const q = (await v4Quote(token, "sell", part)) ?? 0n
-          txs.push(tx(sellCall(token, part, slip(q)), "sell", SELL_GAS))
+          const approvals = hit.venue === "ascend" ? await sellApprovals(wallet, token) : await padSellApprovals(wallet, token)
+          for (const a of approvals) txs.push(tx(a, "approve", APPROVE_GAS))
+          let q = await this.quoteOn(hit, token, "sell", part)
+          if (q === null && hit.venue !== "ascend") q = await simulateNativeReceived([...approvals, padSellCall(hit, part, 0n)].map((c) => ({ from: wallet, ...c })), [wallet]).catch(() => null)
+          q ??= 0n
+          const call = hit.venue === "ascend" ? sellCall(token, part, slip(q)) : padSellCall(hit, part, slip(q))
+          txs.push(tx(call, "sell", hit.venue === "ascend" ? SELL_GAS : PAD_SWAP_GAS))
           ethOut += q; tokensIn += part
         }
       }
-      if (!txs.length) throw new ApiError("This wallet (and its desk) holds none of the coin", 409, "nothing_to_sell")
-      return { chainId: ELYSIUM_CHAIN_ID, venue: dh?.held ? "desk" : "v4", expected: { tokens: Number(formatEther(tokensIn)), eth: Number(formatEther(ethOut)) }, transactions: txs }
+      if (!txs.length) {
+        if (dh && dh.held > 0n && !deskOk) throw new ApiError(`The coin sits in this wallet's desk, but that desk is v1 and cannot trade ${LAUNCHPAD_NAMES[hit.venue]}'s native-HYPE pool: withdraw the coin to the wallet (Desk card) and sell, or redeploy the desk as v2`, 409, "desk_v1")
+        throw new ApiError("This wallet (and its desk) holds none of the coin", 409, "nothing_to_sell")
+      }
+      return { chainId: ELYSIUM_CHAIN_ID, venue: dh?.held && deskOk ? "desk" : "v4", market: hit.venue, expected: { tokens: Number(formatEther(tokensIn)), eth: Number(formatEther(ethOut)) }, transactions: txs }
     }
 
     if (b.action === "create") {
       const m = b.tokenMetadata
       if (!m) throw new ApiError("tokenMetadata is required for a create", 400, "bad_request")
+      const pad: Launchpad = isLaunchpad(b.launchpad) ? b.launchpad : "ascend"
       const devBuyWei = parseEther(String(b.amount ?? 0) as `${number}`)
-      const feePpm = b.feePpm && b.feePpm >= 10_000 && b.feePpm <= 100_000 ? b.feePpm : 10_000
-      const c = publicClient()
-      const txs: EvmTx[] = []
-      if (devBuyWei > 0n) {
-        const [held, allowance] = await Promise.all([
-          c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "balanceOf", args: [wallet] }),
-          c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "allowance", args: [wallet, ADDR.escrowFactory] }),
-        ])
-        if (held < devBuyWei) txs.push(tx({ to: ADDR.whype, data: wrapCalldata(), value: devBuyWei - held }, "wrap", 60_000n))
-        if (allowance < devBuyWei) txs.push(tx({ to: ADDR.whype, data: approveWhypeCalldata(devBuyWei), value: 0n }, "approve", 80_000n))
+      const symbol = m.symbol.replace(/^\$/, "")
+
+      if (pad === "ascend") {
+        const feePpm = b.feePpm && b.feePpm >= 10_000 && b.feePpm <= 100_000 ? b.feePpm : 10_000
+        const c = publicClient()
+        const txs: EvmTx[] = []
+        if (devBuyWei > 0n) {
+          const [held, allowance] = await Promise.all([
+            c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "balanceOf", args: [wallet] }),
+            c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "allowance", args: [wallet, ADDR.escrowFactory] }),
+          ])
+          if (held < devBuyWei) txs.push(tx({ to: ADDR.whype, data: wrapCalldata(), value: devBuyWei - held }, "wrap", 60_000n))
+          if (allowance < devBuyWei) txs.push(tx({ to: ADDR.whype, data: approveWhypeCalldata(devBuyWei), value: 0n }, "approve", 80_000n))
+        }
+        const desk = deskOf(wallet)
+        const params: LaunchParams = { name: m.name, symbol, devBuyWei, feePpm, metadataUri: b.metadataUri ?? null, devReceiver: desk ?? undefined }
+        // the terms (rule set, opening tick) are checked with a dev buy of 0 so the simulation does not need the allowance yet
+        const { ruleSet, startTick } = await pickStartTick(wallet, { ...params, devBuyWei: 0n })
+        txs.push(tx({ to: ADDR.escrowFactory, data: launchCalldata(wallet, params, ruleSet, startTick), value: 0n }, "create", LAUNCH_GAS))
+        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: txs, predicted: { devReceiver: desk ?? wallet }, launchFeeEth: 0 }
       }
-      const desk = deskOf(wallet)
-      const params: LaunchParams = { name: m.name, symbol: m.symbol.replace(/^\$/, ""), devBuyWei, feePpm, metadataUri: b.metadataUri ?? null, devReceiver: desk ?? undefined }
-      // the terms (rule set, opening tick) are checked with a dev buy of 0 so the simulation does not need the allowance yet
-      const { ruleSet, startTick } = await pickStartTick(wallet, { ...params, devBuyWei: 0n })
-      txs.push(tx({ to: ADDR.escrowFactory, data: launchCalldata(wallet, params, ruleSet, startTick), value: 0n }, "create", LAUNCH_GAS))
-      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: txs, predicted: { devReceiver: desk ?? wallet }, launchFeeEth: 0 }
+
+      // Montra / BOXA: one native transaction (the dev buy is its value; no wrap, no approve). Both mint the dev bag
+      // to the launching WALLET; the executor moves it into the dev's desk right after the receipt (bagToDeskTx).
+      const input = { name: m.name, symbol, description: m.description ?? "", imageUri: m.image, website: m.website, twitter: m.twitter, telegram: m.telegram, devBuyWei }
+      let call: { to: Address; data: Hex; value: bigint; gas: bigint }
+      if (pad === "montra") {
+        // the token-URI JSON goes in the tuple's third slot, the image inside `meta` (the right way round)
+        const json = JSON.stringify(montraMetadataJson(input))
+        const { uri: tokenUri } = await pinBuffer(new TextEncoder().encode(json), "application/json", `${symbol.toLowerCase() || "token"}-montra`)
+        call = buildMontraLaunch({ ...input, tokenUri })
+      } else {
+        const feeBps = typeof b.feeBps === "number" && Number.isFinite(b.feeBps) ? Math.max(0, Math.min(500, Math.round(b.feeBps))) : 0
+        call = await buildBoxaLaunch({ ...input, feeBps })
+      }
+      // a read-only run from the dev: refuses on a revert and returns the coin (CREATE2 by the salt baked into this exact calldata)
+      let predictedToken: string | undefined
+      try {
+        const sim = await publicClient().call({ account: wallet, to: call.to, data: call.data, value: call.value })
+        predictedToken = launchPredictedToken(sim.data) ?? undefined
+      } catch (e) {
+        throw new ApiError(`${padName(pad)} refused the launch in simulation: ${String((e as { shortMessage?: string })?.shortMessage ?? (e as Error).message).slice(0, 200)}. Nothing was sent.`, 422, "launch_refused")
+      }
+      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: pad, expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: [tx(call, "create", call.gas)], predicted: { token: predictedToken, devReceiver: wallet }, launchFeeEth: 0 }
     }
 
     if (b.action === "collectCreatorFee") {
       const token = b.token as Address
-      const f = await feeView(token, wallet)
-      if (f.claimableWei === 0n) throw new ApiError(`Nothing claimable yet${f.heldWei > 0n ? ` (${formatEther(f.heldWei)} HYPE held until the coin graduates)` : ""}`, 409, "nothing_to_claim")
-      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", expected: { tokens: 0, eth: Number(formatEther(f.claimableWei)) }, transactions: [tx({ to: f.escrow, data: claimCalldata(wallet), value: 0n }, "claim", 300_000n)] }
+      const hit = await this.venueOr404(token)
+      if (hit.venue === "ascend") {
+        const f = await feeView(token, wallet)
+        if (f.claimableWei === 0n) throw new ApiError(`Nothing claimable yet${f.heldWei > 0n ? ` (${formatEther(f.heldWei)} HYPE held until the coin graduates)` : ""}`, 409, "nothing_to_claim")
+        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(f.claimableWei)) }, transactions: [tx({ to: f.escrow, data: claimCalldata(wallet), value: 0n }, "claim", 300_000n)] }
+      }
+      const f = await padFees(hit, wallet)
+      if (f.claimableWei === 0n) throw new ApiError(`Nothing claimable on ${LAUNCHPAD_NAMES[hit.venue]} yet (the creator cut accrues as the coin trades and is paid to the launch wallet)`, 409, "nothing_to_claim")
+      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: hit.venue, expected: { tokens: 0, eth: Number(formatEther(f.claimableWei)) }, transactions: [tx({ to: f.payer, data: padClaimCalldata(hit, wallet), value: 0n }, "claim", 300_000n)] }
     }
     throw new ApiError(`unknown action ${String(b.action)}`, 400, "bad_request")
   }
 
-  /** The coin a confirmed launch created, off its receipt. */
-  async launchResult(hash: string, devReceiver: Address) {
+  /** The coin a confirmed launch created, off its receipt (Ascend's Launched/EscrowLaunched logs, or a pad's Initialize). A pad coin seeds the venue cache. */
+  async launchResult(hash: string, devReceiver: Address, launchpad: Launchpad = "ascend") {
     const r = await this.rh.tx(hash)
     if (r.status !== "success" || !r.logs) return null
-    return decodeLaunchReceipt(r.logs, devReceiver)
+    if (launchpad === "ascend") return decodeLaunchReceipt(r.logs, devReceiver)
+    const d = decodePadLaunchReceipt(r.logs, devReceiver)
+    if (!d) return null
+    seedPadVenue(launchpad, d.token)
+    return { token: d.token, poolId: d.poolId, escrow: null, devTokens: d.devTokens }
+  }
+
+  /**
+   * The one ERC-20 transfer that moves a wallet's whole bag of `token` into its desk, so the exit is one approval-free
+   * desk call (what the launcher does after a pad launch, where the pad minted the dev bag to the wallet). Null when
+   * the wallet has no desk, its desk is v1 on a pad coin, or it holds none.
+   */
+  async bagToDeskTx(wallet: Address, token: Address): Promise<{ tx: EvmTx; desk: Address; amount: bigint } | null> {
+    const desk = deskOf(wallet)
+    if (!desk || !(await deskSupports(desk, token))) return null
+    const amount = await publicClient().readContract({ address: token, abi: ERC20_ABI, functionName: "balanceOf", args: [wallet] }).catch(() => 0n)
+    if (amount <= 0n) return null
+    const tx: EvmTx = { chainId: ELYSIUM_CHAIN_ID, from: wallet, to: token, data: encodeFunctionData({ abi: ERC20_ABI, functionName: "transfer", args: [desk, amount] }), value: "0", valueEth: "0", gas: str(120_000n), label: "transfer" }
+    return { tx, desk, amount }
   }
 
   static poolIdFor = (token: Address) => poolIdOf(ascendKey(token).key)

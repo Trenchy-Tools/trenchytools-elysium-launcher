@@ -6,6 +6,7 @@
  * message shapes are here, the socket itself belongs to each mode. No node imports.
  */
 import { sendAll } from "./evm"
+import { AppError } from "./errors"
 import type { Env } from "./env"
 import type { Expected } from "../elysium/api"
 import { same, type WalletInfo } from "./wallet-record"
@@ -87,6 +88,8 @@ export function creatorOf(env: Env<{ token?: string; dev: string }>, token: stri
 /** The coin's creator (our launch record, else the chain's creator fee recipient) and what it can claim. `sol` carries the ETH under the name the shared Trading page reads. */
 export async function creatorFees(env: Env<{ token?: string; dev: string }>, token: string): Promise<{ creator: string; sol: number; eth: number; claimableEth: number; pendingEth: number; sweepable: boolean; reason?: string }> {
   const creator = creatorOf(env, token) ?? (await env.api.rh.token(token)).creator
+  // Ascend names the recipient on its escrow; Montra and BOXA do not publish one, so a pad coin we did not launch has no creator to ask for
+  if (!creator) throw new AppError("No creator known for this coin: it was not launched from this app, and its launchpad does not publish one", "no_creator", 404)
   const f = await env.api.rh.creatorFees(creator, token)
   // `pendingEth` is what Ascend holds until the coin graduates ($40k mcap for an hour inside 14 days); it is not sweepable by us.
   return { creator, sol: f.eth, eth: f.eth, claimableEth: f.claimableEth, pendingEth: f.heldEth, sweepable: false, reason: f.heldEth > 0 ? `held until graduation (forfeits ${new Date(f.deadline * 1000).toLocaleDateString()})` : undefined }

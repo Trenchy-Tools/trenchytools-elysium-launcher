@@ -25,7 +25,8 @@ import { Mono } from "@/components/ui/table"
 import { Toggle } from "@/components/ui/toggle"
 import { failureOf, get, post, subscribe, walletsChanged, type Failure } from "@/lib/api"
 import { DEMO, TAB_NOTE } from "@/lib/browser/demo"
-import { chain } from "@/lib/chain"
+import { chain, LAUNCHPAD_BLURB, LAUNCHPAD_NAMES, LAUNCHPADS, type Launchpad } from "@/lib/chain"
+import { BRAND_PAD } from "@/lib/brand"
 
 type Wallet = { publicKey: string; label: string; role: string }
 type PlanRow = { publicKey: string; label: string; role: string; buyEth: number; needEth: number; haveEth?: number; shortEth?: number }
@@ -39,6 +40,9 @@ const BUNDLE_COUNTS = [0, 1, 2, 3, 4, 6, 8, 12, 16]
 const HOLDER_COUNTS = [0, 1, 2, 3, 4, 5, 6, 8, 10]
 const DEV_CHIPS = ["0.05", "0.1", "0.25", "0.5", "1"]
 const FEE_CHIPS: Array<[string, string]> = [["10000", "1 %"], ["20000", "2 %"], ["30000", "3 %"], ["50000", "5 %"], ["100000", "10 %"]]
+/** BOXA's EXTRA fee on top of its hook's own cut, in bps: 0 is what its UI sends, 5 % the most it accepts. */
+const BOXA_FEE_CHIPS: Array<[string, string]> = [["0", "0 %"], ["100", "1 %"], ["200", "2 %"], ["300", "3 %"], ["500", "5 %"]]
+const LAUNCH_GAS_TEXT: Record<Launchpad, string> = { ascend: "~5.2M", montra: "~1.4M", boxa: "~1.9M" }
 const ALL_CHIPS = ["0.05", "0.1", "0.25", "0.5", "1"]
 
 const n = (v: string, d = 0) => (v.trim() === "" || Number.isNaN(Number(v)) ? d : Number(v))
@@ -52,7 +56,8 @@ function Chip({ active, className = "", ...props }: React.ComponentProps<"button
 
 export default function LaunchPage() {
   const router = useRouter()
-  const [f, setF] = React.useState({ name: "", symbol: "", description: "", twitter: "", telegram: "", website: "", devBuyEth: "0.1", slippage: "", feePpm: "10000", exitUsd: "", exitNext: "1", devSellAt: "" })
+  const [f, setF] = React.useState({ name: "", symbol: "", description: "", twitter: "", telegram: "", website: "", devBuyEth: "0.1", slippage: "", feePpm: "10000", feeBps: "0", exitUsd: "", exitNext: "1", devSellAt: "" })
+  const [pad, setPad] = React.useState<Launchpad>(BRAND_PAD)
   const [autoSell, setAutoSell] = React.useState(true)
   const [image, setImage] = React.useState<File | null>(null)
   const [preview, setPreview] = React.useState("")
@@ -92,7 +97,9 @@ export default function LaunchPage() {
   const form = (image = "", rows = { bundle, snipers, holders }, metadataUri?: string) => ({
     name: f.name, symbol: f.symbol, description: f.description, twitter: f.twitter, telegram: f.telegram, website: f.website, image, metadataUri,
     devWallet: devWallet || undefined, devBuyEth: n(f.devBuyEth), slippage: n(f.slippage) || undefined, fundFirst,
-    feePpm: n(f.feePpm) || undefined,
+    launchpad: pad,
+    feePpm: pad === "ascend" ? n(f.feePpm) || undefined : undefined,
+    feeBps: pad === "boxa" ? n(f.feeBps) : undefined,
     exit: autoSell ? { usd: n(f.exitUsd), nextBuyHype: n(f.exitNext), scope: "all" as const } : undefined,
     devSellAtHypeIn: autoSell && n(f.devSellAt) > 0 ? n(f.devSellAt) : undefined,
     bundle: { wallets: rows.bundle.map((r) => ({ publicKey: r.publicKey, amount: n(r.amount), sellAtHypeIn: autoSell && n(r.sellAt) > 0 ? n(r.sellAt) : undefined })) },
@@ -126,7 +133,7 @@ export default function LaunchPage() {
   }, [image])
 
   // the cost, recomputed as the numbers change (the plan does not need the image)
-  const planKey = JSON.stringify([f.devBuyEth, devWallet, bundle, snipers, holders, f.slippage, f.feePpm])
+  const planKey = JSON.stringify([pad, f.devBuyEth, devWallet, bundle, snipers, holders, f.slippage, f.feePpm, f.feeBps])
   React.useEffect(() => {
     const t = setTimeout(() => { post<Plan>("/api/launch/plan", form()).then(setPlan).catch(() => {}) }, 300)
     return () => clearTimeout(t)
@@ -210,9 +217,9 @@ export default function LaunchPage() {
     if (blocker) throw { error: blocker }
     if (!confirm(`Launch ${f.name} (${f.symbol}) with ${buyers} buyer wallet${buyers === 1 ? "" : "s"}? About ${plan ? eth(plan.totalEth) : "…"} ${chain.symbol} in total${plan?.shortEth ? `, ${eth(plan.shortEth)} ${chain.symbol} of it from the ★ wallet` : ""}. This sends real transactions.`)) return
     setLog([]); setDone(null); setSim(null)
-    note("ipfs", "Pinning the image and Ascend's metadata on IPFS…")
+    note("ipfs", `Pinning the image${pad === "ascend" ? " and Ascend's metadata" : ""} on IPFS…${pad === "montra" ? " (Montra's token-URI JSON is pinned with the launch)" : ""}`)
     const up = await uploadImage()
-    note("ipfs", `Image pinned: ${up.image} · metadata ${up.metadataUri}`)
+    note("ipfs", `Image pinned: ${up.image}${pad === "ascend" ? ` · metadata ${up.metadataUri}` : ""}`)
     const rows = await resolveRows()
     const r = await post<{ id: string }>("/api/launch", form(up.image, rows, up.metadataUri))
     setLaunchId(r.id)
@@ -253,9 +260,22 @@ export default function LaunchPage() {
     <div className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <div className="flex flex-col gap-5">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Launch on Ascend</h1>
+          <h1 className="text-xl font-semibold tracking-tight">Launch on {LAUNCHPAD_NAMES[pad]}</h1>
           <p className="text-muted-foreground text-sm">One transaction on Elysium makes the coin, its pool and the dev buy; the moment it confirms, your bundle wallets buy at once and the auto-sell is armed. The image and metadata pin by themselves; when the coin is live, Trading opens on it.</p>
         </div>
+
+        {/* ── the launchpad ── */}
+        <Card className="gap-2">
+          <h2 className="text-[15px] font-semibold">Launchpad</h2>
+          <div className="flex flex-wrap gap-2">
+            {[BRAND_PAD, ...LAUNCHPADS.filter((x) => x !== BRAND_PAD)].map((p) => (
+              <button key={p} type="button" onClick={() => setPad(p)} disabled={launching} aria-pressed={pad === p} className={`flex min-w-44 flex-1 flex-col items-start gap-0.5 rounded-xl border-2 px-3 py-2 text-left transition-colors ${pad === p ? "border-ok bg-ok/5" : "hover:bg-accent"}`}>
+                <span className={`text-sm font-bold tracking-wide uppercase ${pad === p ? "text-ok" : ""}`}>{LAUNCHPAD_NAMES[p]}</span>
+                <span className="text-muted-foreground text-xs">{LAUNCHPAD_BLURB[p]}</span>
+              </button>
+            ))}
+          </div>
+        </Card>
 
         {/* ── the coin ── */}
         <Card className="gap-3">
@@ -302,7 +322,7 @@ export default function LaunchPage() {
                   {[...wallets].sort((a, b) => (a.publicKey === main ? -1 : b.publicKey === main ? 1 : 0)).map((w) => <option key={w.publicKey} value={w.publicKey === main ? "" : w.publicKey}>{w.publicKey === main ? "★ " : ""}{w.label} · {chain.short(w.publicKey)} · {chain.fmt(balances.get(w.publicKey))} {chain.symbol}</option>)}
                 </Select>
                 <span className="font-mono text-sm font-semibold">{chain.fmt(dev ? balances.get(dev) : undefined)} {chain.symbol}</span>
-                {devDesk ? <Pill tone="ok" title={devDesk}>desk {chain.short(devDesk)} · the dev bag lands in it, sells need no approval</Pill> : null}
+                {devDesk ? <Pill tone="ok" title={devDesk}>desk {chain.short(devDesk)} · {pad === "ascend" ? "the dev bag lands in it" : "the dev bag is moved into it right after the launch"}, sells need no approval</Pill> : null}
                 {dev && dev !== main ? <span className="text-warn text-xs">not the ★ wallet: ★ still funds the buyers</span> : null}
               </div>
             ) : (
@@ -315,10 +335,23 @@ export default function LaunchPage() {
             <span className="text-muted-foreground text-xs">{chain.symbol}</span>
             {DEV_CHIPS.map((v) => <Chip key={v} active={f.devBuyEth === v} onClick={() => setF((s) => ({ ...s, devBuyEth: v }))}>{v}</Chip>)}
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-muted-foreground text-xs font-medium tracking-wide uppercase" title="Fixed for ever at launch. Ascend's cut comes out of the first 1 %; everything above it is the creator's, claimable as it accrues. At 1 % the creator's share is held until the coin graduates.">Trade fee</span>
-            {FEE_CHIPS.map(([v, label]) => <Chip key={v} active={f.feePpm === v} onClick={() => setF((s) => ({ ...s, feePpm: v }))}>{label}</Chip>)}
-          </div>
+          {pad === "ascend" ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground text-xs font-medium tracking-wide uppercase" title="Fixed for ever at launch. Ascend's cut comes out of the first 1 %; everything above it is the creator's, claimable as it accrues. At 1 % the creator's share is held until the coin graduates.">Trade fee</span>
+              {FEE_CHIPS.map(([v, label]) => <Chip key={v} active={f.feePpm === v} onClick={() => setF((s) => ({ ...s, feePpm: v }))}>{label}</Chip>)}
+            </div>
+          ) : pad === "boxa" ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground text-xs font-medium tracking-wide uppercase" title="An EXTRA fee on top of BOXA's own hook cut, paid to you as the creator. 0 is what BOXA's own UI sends; up to 5 % is accepted (10 % is refused).">Extra fee</span>
+              {BOXA_FEE_CHIPS.map(([v, label]) => <Chip key={v} active={f.feeBps === v} onClick={() => setF((s) => ({ ...s, feeBps: v }))}>{label}</Chip>)}
+              <span className="text-muted-foreground text-xs">on top of the hook's own cut · yours, claimable from the hook as it accrues</span>
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted-foreground text-xs font-medium tracking-wide uppercase">Trade fee</span>
+              <span className="text-muted-foreground text-xs">Montra's hook sets it (not a launch parameter); the creator's share is claimable from the hook as it accrues</span>
+            </div>
+          )}
           <div className={`flex flex-col gap-2 rounded-lg border p-3 ${autoSell ? "border-warn/50" : ""}`}>
             <div className="flex flex-wrap items-center gap-3">
               <Toggle checked={autoSell} onChange={setAutoSell} label={<span className={`text-[11px] font-semibold tracking-wide uppercase ${autoSell ? "text-warn" : "text-muted-foreground"}`}>Auto-sell {autoSell ? "on" : "off"}</span>} />
@@ -442,7 +475,7 @@ export default function LaunchPage() {
                 <div className="text-muted-foreground flex justify-between text-xs"><span>{fundFirst ? "★ sends at launch (the shortfall)" : "Short (funding is off)"}</span><Mono className={`text-xs ${short ? "text-destructive" : ""}`}>{eth(plan.shortEth ?? 0)} {chain.symbol}</Mono></div>
               </div>
               {plan.warnings.map((w, i) => <p key={i} className="text-warn text-xs">{w}</p>)}
-              <p className="text-muted-foreground text-xs">buy + 0.002 {chain.symbol} gas per wallet, the dev's launch ~5.2M gas · no creation fee · ★ holds {mainBalance === undefined ? "…" : `${eth(mainBalance)} ${chain.symbol}`}</p>
+              <p className="text-muted-foreground text-xs">buy + 0.002 {chain.symbol} gas per wallet, the dev's launch {LAUNCH_GAS_TEXT[pad]} gas · no creation fee · ★ holds {mainBalance === undefined ? "…" : `${eth(mainBalance)} ${chain.symbol}`}</p>
             </>
           ) : <p className="text-muted-foreground text-sm">…</p>}
         </Card>
@@ -454,7 +487,7 @@ export default function LaunchPage() {
         {sim ? (
           <Card className="gap-2">
             <h2 className={`text-[15px] font-semibold ${sim.simulation.ok ? "text-ok" : "text-warn"}`}>{sim.simulation.ok ? "Dry run passed" : "Dry run failed"}</h2>
-            {sim.predicted ? <p className="text-muted-foreground text-xs">Dev bag goes to <Mono className="text-xs">{sim.predicted.devReceiver}</Mono>{sim.predicted.devReceiver?.toLowerCase() !== (dev ?? "").toLowerCase() ? " (its desk)" : " (the wallet; deploy a desk on the Trading page for approval-free sells)"} · dev buy {sim.expected.eth} {chain.symbol} · no creation fee. Nothing was sent.</p> : null}
+            {sim.predicted ? <p className="text-muted-foreground text-xs">{sim.predicted.token ? <>The coin will be <Mono className="text-xs">{sim.predicted.token}</Mono> · </> : null}Dev bag goes to <Mono className="text-xs">{sim.predicted.devReceiver}</Mono>{sim.predicted.devReceiver?.toLowerCase() !== (dev ?? "").toLowerCase() ? " (its desk)" : pad === "ascend" ? " (the wallet; deploy a desk on the Trading page for approval-free sells)" : " (the wallet; moved into its v2 desk right after the launch when it has one)"} · dev buy {sim.expected.eth} {chain.symbol} · no creation fee. Nothing was sent.</p> : null}
             <ul className="flex flex-col gap-1 text-xs">
               {sim.simulation.steps.map((s, i) => <li key={i} className="flex gap-2"><span className={s.ok ? "text-ok" : "text-destructive"}>{s.ok ? "✓" : "✗"}</span><span className="text-muted-foreground w-16 shrink-0">{s.label}</span><span className="break-all">{s.ok ? `gas ${s.gasUsed}` : s.error}</span></li>)}
             </ul>

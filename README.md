@@ -9,6 +9,13 @@ A launch and trading tool for **Ascend** on **Elysium** (Kinetiq's Hyperliquid L
 One Next.js app, one process, one `npm run dev`. A sibling of the pons starter with the same theme and the same
 wallet folder; what differs is how a coin is made and how fast it is sold.
 
+**One codebase, three launchpads.** This is the Ascend edition: the Launch page opens on Ascend. The same app also
+launches on **Montra** and **BOXA** (pick the pad at the top of the Launch page) and trades coins from all three, finding
+each coin's pool by itself. The same code opened on the other pads ships as
+[trenchytools-montra-launcher](https://github.com/Trenchy-Tools/trenchytools-montra-launcher) and
+[trenchytools-boxa-launcher](https://github.com/Trenchy-Tools/trenchytools-boxa-launcher); their READMEs walk through
+how a launch works on each.
+
 > ### Pre-mainnet build
 > Elysium has no official public RPC until its public mainnet launch, so this build **talks to the chain itself over
 > a rotating set of community relays** (Agoradex, Volta, Kleos, ElysPump): reads run over the fastest ones, every

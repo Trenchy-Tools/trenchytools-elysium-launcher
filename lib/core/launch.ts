@@ -1,9 +1,11 @@
 /**
- * The launch executor for Ascend. One launch transaction (wrap + approve ahead of it when there is a dev buy), then
- * buys in three groups. Run by the server on the wallet folder (lib/launch.ts). Every function takes the Env first.
+ * The launch executor for Ascend, Montra and BOXA. One launch transaction (on Ascend: wrap + approve ahead of it when
+ * there is a dev buy), then buys in three groups. Run by the server on the wallet folder (lib/launch.ts). Every
+ * function takes the Env first.
  *
- *   1. api.rh.tradeLocal { action: "create" } → [wrap?] [approve?] create. The dev buy happens INSIDE the launch
- *      (Ascend pulls the WHYPE by approval), and the dev bag lands in the dev wallet's desk when it has one.
+ *   1. api.rh.tradeLocal { action: "create", launchpad } → [wrap?] [approve?] create. The dev buy happens INSIDE the
+ *      launch. On Ascend the dev bag lands in the dev wallet's desk when it has one; Montra and BOXA mint it to the
+ *      wallet, so right after the receipt it is moved into the desk (one transfer) — the exit is then one call.
  *   2. Sign in order with the dev wallet, fan-out each; wait for the create; read the coin off its receipt.
  *   3. The moment it is live: every bundle wallet's buy at once (fire-and-forget through the fan-out, so they land
  *      in the next blocks). Snipers staggered `sniperGapMs`. The staggered buyers (`holders`) go one after another
@@ -16,13 +18,14 @@ import { AppError } from "./errors"
 import { fundDirect, type FundResult } from "./funding"
 import { where, type Env as BaseEnv } from "./env"
 import { sendAll, waitSuccess } from "./evm"
-import { ascendToken, txLink } from "../links"
+import { padToken, txLink } from "../links"
+import { isLaunchpad, LAUNCHPAD_NAMES, type Launchpad } from "../chain"
 import type { Built, EvmTx, Simulation, TokenMetadata } from "../elysium/api"
 import { CHAIN, type WalletInfo } from "./wallet-record"
 
 export const API_FEE_PCT = 0           // no API fee: this app talks to the chain itself
-export const GAS_RESERVE_ETH = 0.002   // a launch is ~5.2M gas, a buy ~0.6M, at 0.1–0.3 gwei
-export const LAUNCH_FEE_ETH = 0        // Ascend charges no creation fee
+export const GAS_RESERVE_ETH = 0.002   // a launch is ~5.2M gas (Ascend) / ~1.4–1.9M (Montra, BOXA), a buy ~0.6M, at 0.1–0.3 gwei
+export const LAUNCH_FEE_ETH = 0        // none of the three charges a creation fee
 export const MAX_BUNDLE = 16
 
 /** `sellAtHypeIn`: this wallet's own auto-sell bar, outside HYPE in (their buys − their sells since launch); 0/absent = none */
@@ -38,13 +41,17 @@ export const STAGGER_DEFAULTS: StaggerRules = { startDelayS: 5, gapMinS: 8, gapM
 export type BuyerGroup = { count: number; eth: number; wallets?: Buyer[] }
 export type LaunchForm = {
   name: string; symbol: string; description?: string; image: string; twitter?: string; telegram?: string; website?: string
+  /** where to launch; Ascend when empty */
+  launchpad?: Launchpad
   /** the pinned Ascend metadata JSON for the calldata suffix (POST /api/launch/image answers it) */
   metadataUri?: string
   /** the creator; the ★ wallet when empty */
   devWallet?: string
   devBuyEth: number
-  /** the pool's trade fee, hundredths of a bip (10000 = 1 %, up to 100000); Settings' figure when empty */
+  /** Ascend: the pool's trade fee, hundredths of a bip (10000 = 1 %, up to 100000); Settings' figure when empty */
   feePpm?: number
+  /** BOXA: the EXTRA fee on top of the hook's own cut, in bps (0–500); 0 when empty */
+  feeBps?: number
   bundle: BuyerGroup; snipers: BuyerGroup; holders: BuyerGroup
   /** the staggered buyers' (holders') rules; absent = spread over Settings' holder window */
   stagger?: StaggerRules
@@ -62,6 +69,7 @@ export type Resolved = { dev: WalletInfo; bundle: Picked[]; snipers: Picked[]; h
 export type LogEntry = { t: number; stage: string; msg: string; hash?: string; link?: string; token?: string; level?: "info" | "ok" | "warn" | "error"; done?: boolean }
 export type LaunchRecord = {
   id: string; createdAt: string; status: "running" | "done" | "failed"; name: string; symbol: string; image: string
+  launchpad?: Launchpad
   token?: string; curve?: string; escrow?: string; devReceiver?: string; dev: string; wallets: { bundle: string[]; snipers: string[]; holders: string[] }
   hashes: { create?: string; buys: Array<{ publicKey: string; role: string; hash?: string; error?: string }> }
   links?: { pons: string; blockscout?: string }
@@ -94,8 +102,11 @@ export function normalizeForm(f: Partial<LaunchForm>): LaunchForm {
   if (!/^(https?:\/\/|ipfs:\/\/)/.test(image)) throw new AppError("image must be an https:// or ipfs:// link: upload one first (POST /api/launch/image)", "bad_request", 400)
   const devBuyEth = Math.max(Number(f.devBuyEth) || 0, 0)
   const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined)
-  const feePpm = Number(f.feePpm) || undefined
+  const launchpad: Launchpad = isLaunchpad(f.launchpad) ? f.launchpad : "ascend"
+  const feePpm = launchpad === "ascend" ? Number(f.feePpm) || undefined : undefined
   if (feePpm !== undefined && (feePpm < 10_000 || feePpm > 100_000)) throw new AppError("feePpm must be between 10000 (1 %) and 100000 (10 %)", "bad_request", 400)
+  const feeBps = launchpad === "boxa" ? Math.round(Number(f.feeBps) || 0) : undefined
+  if (feeBps !== undefined && (feeBps < 0 || feeBps > 500)) throw new AppError("feeBps (BOXA's extra fee) must be between 0 and 500 (5 %)", "bad_request", 400)
   const num = (v: unknown, d: number, lo = 0) => { const x = Number(v); return Number.isFinite(x) && String(v).trim() !== "" ? Math.max(x, lo) : d }
   const st = f.stagger as Partial<StaggerRules> | undefined
   const stagger: StaggerRules | undefined = st ? (() => {
@@ -109,8 +120,15 @@ export function normalizeForm(f: Partial<LaunchForm>): LaunchForm {
     ? { usd: Math.max(Number(f.exit.usd) || 0, 0), nextBuyHype: Math.max(Number(f.exit.nextBuyHype) || 0, 0), scope: f.exit.scope === "noDev" ? "noDev" as const : "all" as const }
     : undefined
   const devSellAtHypeIn = Number(f.devSellAtHypeIn) > 0 ? Number(f.devSellAtHypeIn) : undefined
-  return { name, symbol, image, metadataUri: str(f.metadataUri), description: str(f.description), twitter: str(f.twitter), telegram: str(f.telegram), website: str(f.website), devWallet: str(f.devWallet), devBuyEth, feePpm, stagger, devSellAtHypeIn, bundle: group(f.bundle, MAX_BUNDLE), snipers: group(f.snipers), holders: group(f.holders), slippage: Number(f.slippage) || undefined, fundFirst: f.fundFirst !== false, exit }
+  return { name, symbol, image, launchpad, metadataUri: str(f.metadataUri), description: str(f.description), twitter: str(f.twitter), telegram: str(f.telegram), website: str(f.website), devWallet: str(f.devWallet), devBuyEth, feePpm, feeBps, stagger, devSellAtHypeIn, bundle: group(f.bundle, MAX_BUNDLE), snipers: group(f.snipers), holders: group(f.holders), slippage: Number(f.slippage) || undefined, fundFirst: f.fundFirst !== false, exit }
 }
+
+/** The create body for the chain client: the launchpad and the fee field it takes. */
+const createBody = (env: Env, f: LaunchForm, wallet: string) => ({
+  wallet, action: "create" as const, tokenMetadata: metadataOf(f), amount: f.devBuyEth, slippage: f.slippage ?? env.slippage,
+  launchpad: f.launchpad ?? "ascend", feePpm: f.launchpad === "boxa" || f.launchpad === "montra" ? undefined : f.feePpm ?? env.feePpm, metadataUri: f.metadataUri ?? null, feeBps: f.feeBps,
+})
+const feeText = (env: Env, f: LaunchForm) => (f.launchpad === "montra" ? "trade fee: the hook's default" : f.launchpad === "boxa" ? `extra fee ${((f.feeBps ?? 0) / 100).toFixed(0)} % on top of the hook's` : `trade fee ${((f.feePpm ?? env.feePpm) / 10_000).toFixed(0)} %`)
 
 export function materialize(env: Env, f: LaunchForm): LaunchForm {
   const fill = (g: BuyerGroup, role: "bundle" | "sniper" | "holder"): BuyerGroup => {
@@ -199,7 +217,7 @@ export async function simulate(env: Env, f: LaunchForm): Promise<SimulateResult>
   const r = resolveWallets(env, f)
   env.wallets.assertBackedUp(r.dev.publicKey)
   await checkDevBalance(env, f, r)
-  const built = await env.api.rh.tradeLocal({ wallet: r.dev.publicKey, action: "create", tokenMetadata: metadataOf(f), amount: f.devBuyEth, slippage: f.slippage ?? env.slippage, feePpm: f.feePpm ?? env.feePpm, metadataUri: f.metadataUri ?? null })
+  const built = await env.api.rh.tradeLocal(createBody(env, f, r.dev.publicKey))
   const simulation = await env.api.rh.simulate(built.transactions)
   return { predicted: built.predicted, launchFeeEth: 0, expected: built.expected, simulation, exempt: 0, warnings: r.warnings }
 }
@@ -210,7 +228,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 export function newRecord(f: LaunchForm): LaunchRecord {
   const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
-  return { id, createdAt: new Date().toISOString(), status: "running", name: f.name, symbol: f.symbol, image: f.image, dev: "", wallets: { bundle: [], snipers: [], holders: [] }, hashes: { buys: [] } }
+  return { id, createdAt: new Date().toISOString(), status: "running", name: f.name, symbol: f.symbol, image: f.image, launchpad: f.launchpad ?? "ascend", dev: "", wallets: { bundle: [], snipers: [], holders: [] }, hashes: { buys: [] } }
 }
 
 /** Run a launch to the end. Never throws. `onLive` fires the moment the coin exists (the route arms the auto-sell there). */
@@ -232,7 +250,9 @@ export async function execute(env: Env, record: LaunchRecord, f: LaunchForm, log
     record.dev = r.dev.publicKey
     record.wallets = { bundle: r.bundle.map((w) => w.publicKey), snipers: r.snipers.map((w) => w.publicKey), holders: r.holders.map((w) => w.publicKey) }
     env.launches.save(record)
-    log("prepare", `Dev ${r.dev.publicKey} · ${r.bundle.length} bundle · ${r.snipers.length} snipers · ${r.holders.length} holders · trade fee ${((f.feePpm ?? env.feePpm) / 10_000).toFixed(0)} %`)
+    const pad: Launchpad = f.launchpad ?? "ascend"
+    const padLabel = LAUNCHPAD_NAMES[pad]
+    log("prepare", `${padLabel} · dev ${r.dev.publicKey} · ${r.bundle.length} bundle · ${r.snipers.length} snipers · ${r.holders.length} holders · ${feeText(env, f)}`)
 
     let plan = await planWithBalances(env, f)
     let short = plan.rows.filter((x) => (x.shortEth ?? 0) > 0)
@@ -246,11 +266,11 @@ export async function execute(env: Env, record: LaunchRecord, f: LaunchForm, log
     if (short.length) throw new AppError(`${short.length} wallet(s) are short of HYPE (total ${plan.shortEth?.toFixed(5)}): ${short.map((x) => `${x.label} needs ${x.needEth.toFixed(5)}, has ${(x.haveEth ?? 0).toFixed(5)}`).join("; ")}. Nothing was sent.`, "insufficient_funds", 409, "Send HYPE to the ★ wallet, then launch again")
     log("prepare", "Every wallet holds what the plan asks for", { level: "ok" })
 
-    // the launch: [wrap] [approve] create, the dev bag to the desk when the dev wallet has one
-    const built = await api.rh.tradeLocal({ wallet: r.dev.publicKey, action: "create", tokenMetadata: metadataOf(f), amount: f.devBuyEth, slippage, feePpm: f.feePpm ?? env.feePpm, metadataUri: f.metadataUri ?? null })
+    // the launch: Ascend [wrap] [approve] create with the dev bag to the desk; Montra / BOXA one native create (bag to the wallet, moved below)
+    const built = await api.rh.tradeLocal(createBody(env, f, r.dev.publicKey))
     const devReceiver = built.predicted?.devReceiver ?? r.dev.publicKey
     record.devReceiver = devReceiver
-    log("create", `${built.transactions.length} transaction(s): ${built.transactions.map((t) => t.label).join(" → ")}${devReceiver.toLowerCase() !== r.dev.publicKey.toLowerCase() ? ` · dev bag to the desk ${devReceiver}` : ""}`)
+    log("create", `${built.transactions.length} transaction(s): ${built.transactions.map((t) => t.label).join(" → ")}${devReceiver.toLowerCase() !== r.dev.publicKey.toLowerCase() ? ` · dev bag to the desk ${devReceiver}` : ""}${built.predicted?.token ? ` · the coin will be ${built.predicted.token}` : ""}`)
 
     const devAccount = env.wallets.accountOf(r.dev.publicKey)
     const hashes = await sendAll(api, devAccount, built.transactions, { confirm: false, onStep: (label, hash) => log("create", `${label} sent`, { hash, link: txLink(hash) }) })
@@ -258,16 +278,31 @@ export async function execute(env: Env, record: LaunchRecord, f: LaunchForm, log
     record.hashes.create = createHash
     env.launches.save(record)
     if (!(await waitSuccess(api, createHash, 120_000, (m) => log("create", m)))) throw new Error(`launch ${createHash} not confirmed in 2 minutes; check ${txLink(createHash)} before launching again`)
-    const res = await api.launchResult(createHash, devReceiver as `0x${string}`)
+    const res = await api.launchResult(createHash, devReceiver as `0x${string}`, pad)
     if (!res) throw new Error(`launch ${createHash} confirmed but the coin could not be read off its receipt`)
     const token = res.token
     record.token = token
     record.curve = res.poolId
     record.escrow = res.escrow ?? undefined
-    record.links = { pons: ascendToken(token) }
+    record.links = { pons: padToken(pad, token) }
     env.launches.save(record)
-    log("live", `Live on Ascend: ${ascendToken(token)}${res.devTokens > 0n ? ` · dev holds ${Number(res.devTokens / 10n ** 18n).toLocaleString()} tokens` : ""}`, { hash: createHash, link: ascendToken(token), token, level: "ok" })
-    onLive?.(token, devReceiver, exitBars(f, r))
+    log("live", `Live on ${padLabel}: ${padToken(pad, token)}${res.devTokens > 0n ? ` · dev holds ${Number(res.devTokens / 10n ** 18n).toLocaleString()} tokens` : ""}`, { hash: createHash, link: padToken(pad, token), token, level: "ok" })
+
+    // a pad launch minted the dev bag to the wallet: one transfer puts it in the desk, so the exit is one approval-free call
+    let exitReceiver = devReceiver
+    if (pad !== "ascend" && res.devTokens > 0n) {
+      try {
+        const move = await api.bagToDeskTx(r.dev.publicKey as `0x${string}`, token as `0x${string}`)
+        if (move) {
+          const [h] = await sendAll(api, devAccount, [move.tx], { confirm: true })
+          exitReceiver = move.desk
+          log("desk", `Dev bag moved into the desk ${move.desk} (${Number(move.amount / 10n ** 18n).toLocaleString()} tokens): the exit is one call, nothing to approve`, { hash: h, link: txLink(h), level: "ok" })
+        } else log("desk", "The dev wallet has no v2 desk: its bag stays in the wallet and the exit goes through the router (two approvals first)", { level: "warn" })
+      } catch (e) {
+        log("desk", `Could not move the dev bag into the desk (${e instanceof Error ? e.message.slice(0, 120) : e}); it stays in the wallet`, { level: "warn" })
+      }
+    }
+    onLive?.(token, exitReceiver, exitBars(f, r))
 
     const buy = async (w: Picked, stage: string): Promise<void> => {
       const row: LaunchRecord["hashes"]["buys"][number] = { publicKey: w.publicKey, role: stage }
@@ -301,7 +336,7 @@ export async function execute(env: Env, record: LaunchRecord, f: LaunchForm, log
     const failed = record.hashes.buys.filter((b) => b.error).length
     record.status = "done"
     env.launches.save(record)
-    log("done", `Launch finished: ${record.hashes.buys.length - failed}/${record.hashes.buys.length} buys landed · ${ascendToken(token)}`, { level: failed ? "warn" : "ok", link: ascendToken(token), done: true })
+    log("done", `Launch finished: ${record.hashes.buys.length - failed}/${record.hashes.buys.length} buys landed · ${padToken(pad, token)}`, { level: failed ? "warn" : "ok", link: padToken(pad, token), done: true })
   } catch (e) {
     record.status = "failed"
     record.error = e instanceof Error ? e.message : String(e)

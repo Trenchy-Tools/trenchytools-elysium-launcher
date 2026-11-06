@@ -8,12 +8,14 @@
  */
 import { encodeFunctionData, parseAbi, type Address, type Hex } from "viem"
 import { ADDR, publicClient } from "./chain"
-import { ELYSIUM_DESK_BYTECODE } from "./desk-bytecode"
-import { ascendKey, ERC20_ABI } from "./v4"
-import { DESKS_FILE, readJson, writeJson } from "../paths"
+import { ELYSIUM_DESK_BYTECODE, ELYSIUM_DESK_VERSION } from "./desk-bytecode"
+import { ascendKey, ERC20_ABI, type PoolKey } from "./v4"
+import { venueCached } from "./pads"
+import { DESKS_FILE, readJson, writeJson, serverState } from "../paths"
 
 export const DESK_ABI = parseAbi([
   "function owner() view returns (address)",
+  "function version() view returns (uint8)",
   "function buy((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, uint256 hypeIn, uint256 minOut) returns (uint256 out)",
   "function sell((address currency0, address currency1, uint24 fee, int24 tickSpacing, address hooks) key, uint256 amountIn, uint256 minOut) returns (uint256 out)",
   "function withdrawHype(address to, uint256 amount)",
@@ -24,13 +26,40 @@ export const DESK_ABI = parseAbi([
 export const DESK_DEPLOY_GAS = 1_200_000n
 export const DESK_BUY_GAS = 400_000n
 export const DESK_SELL_GAS = 250_000n
-export { ELYSIUM_DESK_BYTECODE as DESK_BYTECODE }
+export { ELYSIUM_DESK_BYTECODE as DESK_BYTECODE, ELYSIUM_DESK_VERSION as DESK_VERSION }
 
-const key = (token: Address) => ({ ...ascendKey(token).key, hooks: ADDR.launchpad })
+/**
+ * The pool key the desk trades for `token`: a Montra / BOXA coin's native-HYPE key when the venue cache has resolved
+ * one (lib/elysium/pads.ts — every build resolves the venue first, so it is warm), else Ascend's WHYPE key.
+ */
+export function deskKeyFor(token: Address): PoolKey {
+  const hit = venueCached(token)
+  if (hit && hit.venue !== "ascend") return { ...hit.key }
+  return { ...ascendKey(token).key, hooks: ADDR.launchpad }
+}
 
-export const deskBuyData = (token: Address, hypeIn: bigint, minOut: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "buy", args: [key(token), hypeIn, minOut] })
+const versionCache = serverState("deskVersions", () => new Map<string, number>())
+/** 2 for a v2 desk (native-HYPE pools too), 1 for one deployed before version() existed. Remembered per desk. */
+export async function deskVersion(desk: Address): Promise<number> {
+  const k = desk.toLowerCase()
+  const hit = versionCache.get(k)
+  if (hit) return hit
+  const v = await publicClient().readContract({ address: desk, abi: DESK_ABI, functionName: "version" }).then(Number).catch(() => 1)
+  versionCache.set(k, v)
+  return v
+}
+export const rememberDeskVersion = (desk: Address, v: number) => versionCache.set(desk.toLowerCase(), v)
+
+/** Can this desk trade `token`? Ascend coins: any desk. Montra / BOXA coins (native pools on the main PoolManager): a v2 desk. */
+export async function deskSupports(desk: Address, token: Address): Promise<boolean> {
+  const hit = venueCached(token)
+  if (!hit || hit.venue === "ascend") return true
+  return (await deskVersion(desk)) >= ELYSIUM_DESK_VERSION
+}
+
+export const deskBuyData = (token: Address, hypeIn: bigint, minOut: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "buy", args: [deskKeyFor(token), hypeIn, minOut] })
 /** amountIn 0 = everything the desk holds. */
-export const deskSellData = (token: Address, amountIn: bigint, minOut: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "sell", args: [key(token), amountIn, minOut] })
+export const deskSellData = (token: Address, amountIn: bigint, minOut: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "sell", args: [deskKeyFor(token), amountIn, minOut] })
 export const deskWithdrawHypeData = (to: Address, wei: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "withdrawHype", args: [to, wei] })
 export const deskWithdrawTokenData = (token: Address, to: Address, wei: bigint): Hex => encodeFunctionData({ abi: DESK_ABI, functionName: "withdrawToken", args: [token, to, wei] })
 

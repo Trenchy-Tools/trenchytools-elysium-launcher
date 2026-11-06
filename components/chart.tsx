@@ -9,17 +9,18 @@ import { useTheme } from "next-themes"
 import { ExternalLink } from "lucide-react"
 import { chain } from "@/lib/chain"
 
-export function Chart({ coin, className = "" }: { coin: string; className?: string }) {
+/** `venue`: which launchpad's pool the coin trades on (from GET /api/trading/token), so "open on …" points at the right site. */
+export function Chart({ coin, venue: market, className = "" }: { coin: string; venue?: string; className?: string }) {
   const { resolvedTheme } = useTheme()
   const [mounted, setMounted] = React.useState(false)
   const [open, setOpen] = React.useState(true)
   React.useEffect(() => setMounted(true), [])
   const theme = resolvedTheme === "light" ? "light" : "dark"
   const url = mounted ? chain.chartUrl(coin, theme) : null
-  const gmgn = chain.coinLinks(coin).find((l) => l.label === "gmgn")
+  const gmgn = chain.coinLinks(coin, market).find((l) => l.label === "gmgn")
   // a chain with no embeddable chart yet (Elysium): one quiet row pointing at the venue's own page
   if (chain.chartUrl(coin, theme) === null) {
-    const venue = chain.coinLinks(coin)[0]
+    const venue = chain.coinLinks(coin, market)[0]
     return (
       <div className={`bg-card flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border px-3 py-1.5 text-xs ${className}`}>
         <span className="font-medium">Chart</span>
