@@ -16,8 +16,8 @@
  *   creator's cut is held until graduation ($40k mcap for an hour inside 14 days, else forfeited); above 1 % the
  *   excess is the creator's and claimable as it accrues. escrow.claim(account) takes it.
  */
-import { concatHex, encodeAbiParameters, encodeFunctionData, parseAbi, stringToHex, type Address, type Hex } from "viem"
-import { ADDR, publicClient } from "./chain"
+import { concatHex, encodeAbiParameters, encodeFunctionData, parseAbi, parseEther, stringToHex, type Address, type Hex } from "viem"
+import { ADDR, publicClient, simulateCalls, type SimCall } from "./chain"
 import { ascendKey, ERC20_ABI, poolExists, poolIdOf } from "./v4"
 
 export const FACTORY_ABI = parseAbi([
@@ -29,6 +29,7 @@ export const LAUNCHPAD_ABI = parseAbi([
   "function paused() view returns (bool)",
   "function collectedFees(bytes32 poolId) view returns (uint256)",
   "function currentFee(bytes32 poolId) view returns (uint24)",
+  "function collect(bytes32 poolId) returns (uint256)",
 ])
 export const ESCROW_ABI = parseAbi([
   "function claimable(address account) view returns (uint256 amount)",
@@ -78,28 +79,32 @@ export function launchCalldata(sender: Address, p: LaunchParams, ruleSet: Addres
 }
 
 /**
- * Which opening tick the factory accepts for this coin, by simulation from the sender (the WHYPE allowance must be in
- * place first, so run it after the approve lands, or with devBuyWei 0 to check the terms alone). Throws with the
- * factory's reason when neither sign is accepted.
+ * The launch call the factory accepts, and the coin it will create, by simulating `pre` (the wrap and approve) and the
+ * launch together on the live chain. The sign of the opening tick depends on where the coin's address sorts against
+ * WHYPE, and that address comes from the salt, so the salt that is tried here is the one that must be signed. Throws
+ * with the factory's reason when neither sign is accepted.
  */
-export async function pickStartTick(sender: Address, p: LaunchParams): Promise<{ ruleSet: Address; startTick: number }> {
+export async function checkedLaunch(sender: Address, p: LaunchParams & { salt: Hex }, pre: SimCall[]): Promise<{ data: Hex; token: Address }> {
   const c = publicClient()
   const [paused, ruleSet] = await Promise.all([
     c.readContract({ address: ADDR.launchpad, abi: LAUNCHPAD_ABI, functionName: "paused" }),
     c.readContract({ address: ADDR.escrowFactory, abi: FACTORY_ABI, functionName: "ruleSet" }),
   ])
   if (paused) throw new Error("Ascend has paused launches. Nothing was sent.")
-  let last = ""
+  const balance = pre.reduce((n, t) => n + t.value, parseEther("1"))
+  let last = "no RPC could simulate it"
   for (const tick of [START_TICK_WHYPE, -START_TICK_WHYPE]) {
-    try {
-      await c.simulateContract({ address: ADDR.escrowFactory, abi: FACTORY_ABI, functionName: "launchChecked", args: launchArgs(sender, { ...p, salt: p.salt ?? randomSalt() }, ruleSet, tick), account: sender })
-      return { ruleSet, startTick: tick }
-    } catch (e) {
-      last = (e as { shortMessage?: string })?.shortMessage ?? (e as Error).message
-    }
+    const data = launchCalldata(sender, p, ruleSet, tick)
+    const sim = await simulateCalls([...pre, { from: sender, to: ADDR.escrowFactory, data, value: 0n, gas: LAUNCH_GAS }], { [sender]: balance })
+    const res = sim?.at(-1)
+    if (res?.ok && res.returnData.length >= 66) return { data, token: `0x${res.returnData.slice(26, 66)}` as Address }
+    if (res?.error) last = res.error
   }
   throw new Error(`Ascend refused the launch in simulation: ${last.slice(0, 200)}. Nothing was sent.`)
 }
+
+/** Moves the fees the pool's hook has collected into the escrow. Permissionless, and a claim reverts without it when the escrow holds nothing yet (11/8). */
+export const collectCalldata = (poolId: Hex): Hex => encodeFunctionData({ abi: LAUNCHPAD_ABI, functionName: "collect", args: [poolId] })
 
 export type LaunchReceipt = { token: Address; poolId: Hex; escrow: Address | null; devTokens: bigint }
 

@@ -100,6 +100,21 @@ export async function waitSuccess(api: ElysiumApi, hash: string, timeoutMs = 60_
 export type SendOptions = { confirm?: boolean; onStep?: (label: string, hash: string) => void; acct?: AccountData }
 
 /**
+ * Sign a run of transactions for one wallet and send them together as one ordered batch to every RPC, without waiting
+ * between them. How a launch goes out: the wrap, the approve, the launch and the sell approvals land one after another
+ * in under a second, where waiting for each receipt costs a round trip per step. The caller waits for the receipt it needs.
+ */
+export async function sendTogether(api: ElysiumApi, account: PrivateKeyAccount, txs: UnsignedTx[], opts: SendOptions = {}): Promise<string[]> {
+  const acct = opts.acct ?? (await api.rh.account(account.address))
+  const nonces = new Nonces(acct)
+  const raws: Hex[] = []
+  for (const tx of txs) raws.push(await signTx(account, acct, nonces, tx))
+  const { hashes } = await api.rh.sendBatch(raws)
+  hashes.forEach((hash, i) => opts.onStep?.(txs[i].label ?? "tx", hash))
+  return hashes
+}
+
+/**
  * Sign and send a run of transactions for one wallet, in order: account read once, nonce + 1 per transaction,
  * fan-out broadcast each. Approvals and wraps are confirmed before the next one goes out (the sequencer refuses a
  * sell whose nonce sits behind an unmined approve); the last trade is confirmed when `confirm` is true.

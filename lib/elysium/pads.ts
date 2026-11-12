@@ -22,7 +22,7 @@
 import { encodeFunctionData, parseAbi, type Address, type Hex } from "viem"
 import { ADDR, publicClient } from "./chain"
 import { ascendKey, poolExists, poolIdOf, quoteKey, sellApprovals, v4ExactInCall, type Call, type PoolKey } from "./v4"
-import { serverState } from "../paths"
+import { appState } from "../state"
 
 import { isLaunchpad, LAUNCHPAD_NAMES, LAUNCHPADS, type ElysiumPad, type Launchpad } from "../chain"
 
@@ -83,7 +83,7 @@ export async function detectPad(token: Address): Promise<PadPool | null> {
 export type Venue = Launchpad
 export type VenueHit = { venue: Venue; pad?: ElysiumPad; poolId: Hex; key: PoolKey; /** always the main PoolManager for these three */ poolManager: Address; tokenIsCurrency0: boolean }
 
-const venues = serverState("venues", () => new Map<string, VenueHit>())
+const venues = appState("venues", () => new Map<string, VenueHit>())
 
 export const venueCached = (token: string): VenueHit | null => venues.get(token.toLowerCase()) ?? null
 export function seedVenue(token: string, hit: VenueHit): void { venues.set(token.toLowerCase(), hit) }

@@ -10,6 +10,7 @@
  */
 import fs from "node:fs"
 import path from "node:path"
+import { setKV } from "./kv"
 
 export const BACKUP_DIR: string = (() => {
   const env = (process.env.WALLET_BACKUP_DIR || "").trim()
@@ -45,13 +46,11 @@ export function writeJson(file: string, data: unknown, mode = 0o600): void {
   fs.renameSync(tmp, file)
 }
 
-/**
- * Server state that must survive a dev-server hot reload (timers, launch logs, the trade feed, the exit watchers):
- * module scope is re-created on reload, `globalThis` is not.
- */
-export function serverState<T>(key: string, init: () => T): T {
-  const g = globalThis as unknown as Record<string, T>
-  const k = `__elysium_starter_${key}`
-  if (!(k in g)) g[k] = init()
-  return g[k]
-}
+/** Server state that must survive a dev-server hot reload: see lib/state.ts (kept here under its old name). */
+export { appState as serverState } from "./state"
+
+// The chain layer's records (desks.json, exits.json) are files in APP_DIR on the server (lib/kv.ts is the seam).
+setKV({
+  read: <T,>(name: string, fallback: T): T => readJson<T>(path.join(APP_DIR, `${name}.json`), fallback),
+  write: (name: string, value: unknown): void => writeJson(path.join(APP_DIR, `${name}.json`), value),
+})

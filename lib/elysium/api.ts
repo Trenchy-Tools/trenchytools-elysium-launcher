@@ -6,7 +6,8 @@
  *   rh.account        chainId, pending nonce, gas, balance            (one read per wallet per batch)
  *   rh.tradeLocal     the unsigned transactions of a buy / sell / create / collectCreatorFee, in order
  *   rh.simulate       each transaction run through eth_call from its sender
- *   rh.send           raw bytes to every relay at once (fan-out)
+ *   rh.send           raw bytes to every RPC at once (fan-out)
+ *   rh.sendBatch      a wallet's transactions in nonce order, as one batch to every RPC (how a launch goes out)
  *   rh.tx             receipt → success | reverted | pending_or_unknown
  *   rh.quote          the V4 quoter
  *   rh.token          name, symbol, pool
@@ -19,10 +20,10 @@
  * when the coin sits there: one call, nothing to approve. Otherwise the UniversalRouter, with the approvals first.
  */
 import { encodeFunctionData, formatEther, parseEther, type Address, type Hex } from "viem"
-import { ADDR, ELYSIUM_CHAIN_ID, publicClient, sendRaw, simulateNativeReceived, simulateSequence, TRANSFER_GAS } from "./chain"
+import { ADDR, ELYSIUM_CHAIN_ID, publicClient, raceRpc, sendBatch, sendRaw, simulateCalls, simulateNativeReceived, simulateSequence, TRANSFER_GAS, type SimCall } from "./chain"
 import { ApiError } from "../core/errors"
-import { APPROVE_GAS, BUY_GAS, ERC20_ABI, SELL_GAS, ascendKey, poolIdOf, quote as v4Quote, sellApprovals, buyCall, sellCall } from "./v4"
-import { LAUNCH_GAS, approveWhypeCalldata, claimCalldata, decodeLaunchReceipt, feeView, launchCalldata, pickStartTick, tokenInfo, wrapCalldata, WETH9_ABI, type LaunchParams } from "./ascend"
+import { APPROVE_GAS, BUY_GAS, ERC20_ABI, SELL_GAS, ascendKey, newCoinSellApprovals, poolIdOf, quote as v4Quote, sellApprovals, buyCall, sellCall } from "./v4"
+import { LAUNCH_GAS, approveWhypeCalldata, checkedLaunch, claimCalldata, collectCalldata, decodeLaunchReceipt, feeView, randomSalt, tokenInfo, wrapCalldata, WETH9_ABI, type LaunchParams } from "./ascend"
 import { DESK_BUY_GAS, DESK_SELL_GAS, deskBuyData, deskHolding, deskOf, deskSellData, deskSupports } from "./desk"
 import { isLaunchpad, LAUNCHPAD_NAMES, padBuyCall, padClaimCalldata, padFees, padQuote, padSellApprovals, padSellCall, PAD_SWAP_GAS, resolveVenue, seedPadVenue, type Launchpad, type Venue, type VenueHit } from "./pads"
 import { buildBoxaLaunch, buildMontraLaunch, decodePadLaunchReceipt, launchPredictedToken, montraMetadataJson, padName } from "./pad-launch"
@@ -93,15 +94,15 @@ export class ElysiumApi {
         c.getBlockNumber(),
         c.getGasPrice(),
       ])
-      // Orbit: a legacy gas price is the base fee; 1.5× leaves room for a bump between the read and the block, no tip.
-      return { wallet, chainId: ELYSIUM_CHAIN_ID, nonce, pendingNonce, balanceEth: formatEther(balance), block: Number(block), gasPrice: str(gasPrice), maxFeePerGas: str((gasPrice * 15n) / 10n), maxPriorityFeePerGas: "0", transferGas: str(TRANSFER_GAS) }
+      // Orbit charges the base fee, not the cap: 3× (the launcher's cap) so a busy minute cannot price a signed transaction out, no tip.
+      return { wallet, chainId: ELYSIUM_CHAIN_ID, nonce, pendingNonce, balanceEth: formatEther(balance), block: Number(block), gasPrice: str(gasPrice), maxFeePerGas: str(gasPrice * 3n), maxPriorityFeePerGas: "0", transferGas: str(TRANSFER_GAS) }
     }),
 
     tradeLocal: (b: TradeBody): Promise<Built> => this.step("POST", `build ${b.action}${b.token ? ` ${b.token.slice(0, 10)}` : ""}`, () => this.build(b), (r) => `${r.transactions.length} tx · ${r.venue}`),
 
     simulate: (transactions: EvmTx[]): Promise<Simulation> => this.step("POST", "simulate", async () => {
       // the sequence as a whole first: a create needs the wrap and the approve before it to have happened
-      const seq = await simulateSequence(transactions.map((t) => ({ from: t.from as Address, to: t.to as Address, data: t.data as Hex, value: BigInt(t.value || "0") })))
+      const seq = await simulateSequence(transactions.map((t) => ({ from: t.from as Address, to: t.to as Address, data: t.data as Hex, value: BigInt(t.value || "0"), ...(t.gas ? { gas: BigInt(t.gas) } : {}) })))
       if (seq) {
         const steps = seq.map((s, i) => ({ label: transactions[i].label, ok: s.ok, gasUsed: s.gasUsed === null ? null : str(s.gasUsed), error: s.error }))
         return { ok: steps.every((s) => s.ok), steps }
@@ -122,10 +123,12 @@ export class ElysiumApi {
 
     send: (transaction: string): Promise<{ hash: string }> => this.step("POST", "send (fan-out)", async () => ({ hash: await sendRaw(transaction as Hex) })),
 
+    sendBatch: (transactions: Hex[]): Promise<{ hashes: string[] }> => this.step("POST", `send batch of ${transactions.length}`, async () => ({ hashes: await sendBatch(transactions) })),
+
     tx: async (hash: string): Promise<TxStatus> => {
-      const r = await publicClient().getTransactionReceipt({ hash: hash as Hex }).catch(() => null)
+      const r = await raceRpc<{ status: string; blockNumber: string; gasUsed: string; logs: TxStatus["logs"] }>("eth_getTransactionReceipt", [hash]).catch(() => null)
       if (!r) return { hash, status: "pending_or_unknown" }
-      return { hash, status: r.status === "success" ? "success" : "reverted", block: Number(r.blockNumber), gasUsed: str(r.gasUsed), logs: r.logs as TxStatus["logs"] }
+      return { hash, status: r.status === "0x1" ? "success" : "reverted", block: Number(r.blockNumber), gasUsed: str(BigInt(r.gasUsed)), logs: r.logs }
     },
 
     quote: (p: { token: string; action: "buy" | "sell"; amount: number; wallet?: string }): Promise<Quote> => this.step("GET", `quote ${p.action} ${p.amount}`, async () => {
@@ -305,6 +308,8 @@ export class ElysiumApi {
       const pad: Launchpad = isLaunchpad(b.launchpad) ? b.launchpad : "ascend"
       const devBuyWei = parseEther(String(b.amount ?? 0) as `${number}`)
       const symbol = m.symbol.replace(/^\$/, "")
+      // no desk to hold the bag: the two sell approvals ride right behind the launch, so the exit is one transaction
+      const approvalsBehind = (token: Address): EvmTx[] => (deskOf(wallet) || devBuyWei === 0n ? [] : newCoinSellApprovals(token).map((a) => tx(a, "approve", APPROVE_GAS)))
 
       if (pad === "ascend") {
         const feePpm = b.feePpm && b.feePpm >= 10_000 && b.feePpm <= 100_000 ? b.feePpm : 10_000
@@ -315,15 +320,15 @@ export class ElysiumApi {
             c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "balanceOf", args: [wallet] }),
             c.readContract({ address: ADDR.whype, abi: WETH9_ABI, functionName: "allowance", args: [wallet, ADDR.escrowFactory] }),
           ])
-          if (held < devBuyWei) txs.push(tx({ to: ADDR.whype, data: wrapCalldata(), value: devBuyWei - held }, "wrap", 60_000n))
-          if (allowance < devBuyWei) txs.push(tx({ to: ADDR.whype, data: approveWhypeCalldata(devBuyWei), value: 0n }, "approve", 80_000n))
+          if (held < devBuyWei) txs.push(tx({ to: ADDR.whype, data: wrapCalldata(), value: devBuyWei - held }, "wrap", 120_000n))
+          if (allowance < devBuyWei) txs.push(tx({ to: ADDR.whype, data: approveWhypeCalldata(devBuyWei), value: 0n }, "approve", 120_000n))
         }
         const desk = deskOf(wallet)
-        const params: LaunchParams = { name: m.name, symbol, devBuyWei, feePpm, metadataUri: b.metadataUri ?? null, devReceiver: desk ?? undefined }
-        // the terms (rule set, opening tick) are checked with a dev buy of 0 so the simulation does not need the allowance yet
-        const { ruleSet, startTick } = await pickStartTick(wallet, { ...params, devBuyWei: 0n })
-        txs.push(tx({ to: ADDR.escrowFactory, data: launchCalldata(wallet, params, ruleSet, startTick), value: 0n }, "create", LAUNCH_GAS))
-        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: txs, predicted: { devReceiver: desk ?? wallet }, launchFeeEth: 0 }
+        const params: LaunchParams & { salt: Hex } = { name: m.name, symbol, devBuyWei, feePpm, salt: randomSalt(), metadataUri: b.metadataUri ?? null, devReceiver: desk ?? undefined }
+        const pre: SimCall[] = txs.map((t) => ({ from: wallet, to: t.to as Address, data: t.data as Hex, value: BigInt(t.value), gas: BigInt(t.gas ?? 0) }))
+        const launch = await checkedLaunch(wallet, params, pre)
+        txs.push(tx({ to: ADDR.escrowFactory, data: launch.data, value: 0n }, "create", LAUNCH_GAS), ...approvalsBehind(launch.token))
+        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: txs, predicted: { token: launch.token, devReceiver: desk ?? wallet }, launchFeeEth: 0 }
       }
 
       // Montra / BOXA: one native transaction (the dev buy is its value; no wrap, no approve). Both mint the dev bag
@@ -339,15 +344,15 @@ export class ElysiumApi {
         const feeBps = typeof b.feeBps === "number" && Number.isFinite(b.feeBps) ? Math.max(0, Math.min(500, Math.round(b.feeBps))) : 0
         call = await buildBoxaLaunch({ ...input, feeBps })
       }
-      // a read-only run from the dev: refuses on a revert and returns the coin (CREATE2 by the salt baked into this exact calldata)
-      let predictedToken: string | undefined
-      try {
-        const sim = await publicClient().call({ account: wallet, to: call.to, data: call.data, value: call.value })
-        predictedToken = launchPredictedToken(sim.data) ?? undefined
-      } catch (e) {
-        throw new ApiError(`${padName(pad)} refused the launch in simulation: ${String((e as { shortMessage?: string })?.shortMessage ?? (e as Error).message).slice(0, 200)}. Nothing was sent.`, 422, "launch_refused")
-      }
-      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: pad, expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: [tx(call, "create", call.gas)], predicted: { token: predictedToken, devReceiver: wallet }, launchFeeEth: 0 }
+      // a read-only run from the dev under the launch's own gas cap: refuses on a revert and returns the coin (CREATE2 by the salt baked into this exact calldata)
+      const sim = await simulateCalls([{ from: wallet, ...call }], { [wallet]: call.value + parseEther("1") })
+      if (!sim) throw new ApiError("No RPC could simulate this launch. Nothing was sent.", 502, "no_simulation")
+      const [run] = sim
+      if (!run.ok) throw new ApiError(`${padName(pad)} refused the launch in simulation: ${run.error}. Nothing was sent.`, 422, "launch_refused")
+      if (run.gasUsed !== null && run.gasUsed >= call.gas) throw new ApiError(`The launch used ${run.gasUsed} of a ${call.gas} gas cap, one storage write from reverting. Shorten the description. Nothing was sent.`, 422, "launch_refused")
+      const predictedToken = launchPredictedToken(run.returnData)
+      if (!predictedToken) throw new ApiError(`${padName(pad)} returned no coin address in simulation. Nothing was sent.`, 422, "launch_refused")
+      return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: pad, expected: { tokens: 0, eth: Number(formatEther(devBuyWei)) }, transactions: [tx(call, "create", call.gas), ...approvalsBehind(predictedToken)], predicted: { token: predictedToken, devReceiver: wallet }, launchFeeEth: 0 }
     }
 
     if (b.action === "collectCreatorFee") {
@@ -356,7 +361,7 @@ export class ElysiumApi {
       if (hit.venue === "ascend") {
         const f = await feeView(token, wallet)
         if (f.claimableWei === 0n) throw new ApiError(`Nothing claimable yet${f.heldWei > 0n ? ` (${formatEther(f.heldWei)} HYPE held until the coin graduates)` : ""}`, 409, "nothing_to_claim")
-        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(f.claimableWei)) }, transactions: [tx({ to: f.escrow, data: claimCalldata(wallet), value: 0n }, "claim", 300_000n)] }
+        return { chainId: ELYSIUM_CHAIN_ID, venue: "launch", market: "ascend", expected: { tokens: 0, eth: Number(formatEther(f.claimableWei)) }, transactions: [tx({ to: ADDR.launchpad, data: collectCalldata(hit.poolId), value: 0n }, "fee", 300_000n), tx({ to: f.escrow, data: claimCalldata(wallet), value: 0n }, "claim", 300_000n)] }
       }
       const f = await padFees(hit, wallet)
       if (f.claimableWei === 0n) throw new ApiError(`Nothing claimable on ${LAUNCHPAD_NAMES[hit.venue]} yet (the creator cut accrues as the coin trades and is paid to the launch wallet)`, 409, "nothing_to_claim")

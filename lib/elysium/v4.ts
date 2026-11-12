@@ -185,6 +185,12 @@ export async function sellApprovals(owner: Address, token: Address): Promise<Cal
   return out
 }
 
+/** The same two approvals for a coin the launch is about to create (nothing to read yet): they ride in the launch's own batch. */
+export const newCoinSellApprovals = (token: Address): Call[] => [
+  { to: token, data: encodeFunctionData({ abi: ERC20_ABI, functionName: "approve", args: [ADDR.permit2, MAX] }), value: 0n },
+  { to: ADDR.permit2, data: encodeFunctionData({ abi: PERMIT2_ABI, functionName: "approve", args: [token, ADDR.universalRouter, PERMIT2_MAX_AMOUNT, PERMIT2_MAX_EXPIRATION] }), value: 0n },
+]
+
 export const BUY_GAS = 700_000n
 export const SELL_GAS = 700_000n
 export const APPROVE_GAS = 120_000n

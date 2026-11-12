@@ -42,7 +42,8 @@ const httpImage = (uri: string): string => (uri.startsWith("ipfs://") ? `https:/
 export const MONTRA_LAUNCH_SELECTOR: Hex = "0x579ba2d5"
 /** The tag Montra's UI appends after the ABI data ("montra" + 18 bytes, an ERC-8021 attribution); accepted with or without it. */
 export const MONTRA_LAUNCH_SUFFIX: Hex = "0x6d6f6e747261060080218021802180218021802180218021"
-export const MONTRA_LAUNCH_GAS = 1_400_000n
+/** A launch costs 1.04M with no description and 1.51M at 600 characters: the token URI and metadata are written to storage. 1.4M reverted on 11/8 for every description over about 480 characters. */
+export const MONTRA_LAUNCH_GAS = 1_900_000n
 
 type MontraLaunchParams = {
   name: string; symbol: string; tokenUri: string

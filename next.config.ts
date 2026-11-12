@@ -2,16 +2,18 @@ import type { NextConfig } from "next"
 
 /**
  * Demo mode (NEXT_PUBLIC_DEMO=1 at build time): the hosted app keeps every wallet key in the visitor's browser, so the
- * page gets a strict Content Security Policy. Scripts only from this origin, network only to this origin and the
- * Hyperliquid price feed, no framing. Keys in browser storage are only as safe as the page that holds them.
+ * page gets a strict Content Security Policy. Scripts only from this origin; network only to this origin, Elysium's
+ * public relays (every chain read and send goes from the tab straight to them), the TrenchyTools API (the visitor's
+ * key and IPFS pins) and the Hyperliquid price feed; no framing. Keys in browser storage are only as safe as the page that holds them.
  * ('unsafe-inline' scripts: Next's inline bootstrap needs them; styles: the theme switcher and Tailwind.)
  */
 const DEMO = process.env.NEXT_PUBLIC_DEMO === "1"
 const CSP = [
   "default-src 'self'",
-  "connect-src 'self' https://api.hyperliquid.xyz",
+  // keep in step with DEFAULT_RPCS in lib/elysium/chain.ts (the browser always uses the defaults)
+  "connect-src 'self' https://api.hyperliquid.xyz https://api.trenchy.tools https://rpc.elysium.kinetiq.xyz https://rpc.agoradex.app https://rpc.volta.family https://rpc.thekleos.pro https://rpc-live.elysp.com",
   "img-src 'self' data: blob: https:",
-  "script-src 'self' 'unsafe-inline'",
+  `script-src 'self' 'unsafe-inline'${process.env.NODE_ENV === "development" ? " 'unsafe-eval'" : ""}`, // next dev only: React's dev build needs eval()
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self'",
   "object-src 'none'",

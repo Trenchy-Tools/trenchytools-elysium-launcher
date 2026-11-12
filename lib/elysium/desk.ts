@@ -11,7 +11,8 @@ import { ADDR, publicClient } from "./chain"
 import { ELYSIUM_DESK_BYTECODE, ELYSIUM_DESK_VERSION } from "./desk-bytecode"
 import { ascendKey, ERC20_ABI, type PoolKey } from "./v4"
 import { venueCached } from "./pads"
-import { DESKS_FILE, readJson, writeJson, serverState } from "../paths"
+import { appState } from "../state"
+import { kv } from "../kv"
 
 export const DESK_ABI = parseAbi([
   "function owner() view returns (address)",
@@ -38,7 +39,7 @@ export function deskKeyFor(token: Address): PoolKey {
   return { ...ascendKey(token).key, hooks: ADDR.launchpad }
 }
 
-const versionCache = serverState("deskVersions", () => new Map<string, number>())
+const versionCache = appState("deskVersions", () => new Map<string, number>())
 /** 2 for a v2 desk (native-HYPE pools too), 1 for one deployed before version() existed. Remembered per desk. */
 export async function deskVersion(desk: Address): Promise<number> {
   const k = desk.toLowerCase()
@@ -65,18 +66,19 @@ export const deskWithdrawTokenData = (token: Address, to: Address, wei: bigint):
 
 // ── the registry ──────────────────────────────────────────────────────────────
 
-const read = (): Record<string, Address> => readJson<Record<string, Address>>(DESKS_FILE, {})
+// which wallet owns which desk: desks.json on the server, localStorage in demo mode (lib/kv.ts)
+const read = (): Record<string, Address> => kv().read<Record<string, Address>>("desks", {})
 export const deskOf = (wallet: string): Address | null => read()[wallet.toLowerCase()] ?? null
 export const allDesks = (): Record<string, Address> => read()
 export function rememberDesk(wallet: string, desk: Address): void {
   const all = read()
   all[wallet.toLowerCase()] = desk
-  writeJson(DESKS_FILE, all)
+  kv().write("desks", all)
 }
 export function forgetDesk(wallet: string): void {
   const all = read()
   delete all[wallet.toLowerCase()]
-  writeJson(DESKS_FILE, all)
+  kv().write("desks", all)
 }
 
 export type DeskView = { desk: Address; owner: Address; hypeWei: bigint; tokenWei: bigint }

@@ -2,21 +2,20 @@
  * Elysium (Kinetiq's Hyperliquid L2, Arbitrum Orbit, chain 99901, HYPE as the native coin) as this app sees it:
  * the chain, the relays, the contracts and one public client. Server-side only (node fetch, no window).
  *
- * RELAYS. There is no official public RPC before the public launch; the community relays all front the one
- * sequencer. Measured 11/5: Agoradex ~200 ms, Volta ~250 ms, Kleos ~500 ms, BOXA ~250 ms but refuses web origins and
- * holds sends in its own queue, ElysPump 2–5 s with drops. Reads run over the fast three; every signed transaction
- * goes to ALL send relays at once (fanout-send.ts) and the first acceptance wins. ELYSIUM_RPC_URLS (comma list)
- * overrides the defaults; the official Conduit endpoint goes first the day it opens.
+ * RPCS. The official RPC (rpc.elysium.kinetiq.xyz, open since 11/8) goes first, with the community relays behind it;
+ * they all front the one sequencer. Launches through this list land in about 0.4 s; through the relays alone, before
+ * the chain opened, they waited about 15 s. Reads run over the fast ones; every signed transaction goes to ALL of them
+ * at once (fanout-send.ts) and the first acceptance wins. ELYSIUM_RPC_URLS (comma list) overrides the defaults.
  *
  * CONTRACTS are Ascend's published mainnet set (from block 422319), cross-checked against live launches and trades.
  */
 import { createPublicClient, defineChain, fallback, http, type Address, type Hex, type PublicClient } from "viem"
-import { fanoutSendRaw } from "./fanout-send"
-import { serverState } from "../paths"
+import { sendBatchTo } from "./fanout-send"
+import { appState } from "../state"
 
 export const ELYSIUM_CHAIN_ID = 99901
 
-export type SimCall = { from: Address; to: Address; data: Hex; value: bigint }
+export type SimCall = { from: Address; to: Address; data: Hex; value: bigint; gas?: bigint }
 export type SimStep = { ok: boolean; gasUsed: bigint | null; error: string | null }
 /**
  * eth_simulateV1: the calls run one after another on top of the latest block, each seeing the state the previous
@@ -33,9 +32,23 @@ export async function simulateSequence(calls: SimCall[]): Promise<SimStep[] | nu
 }
 
 type RawSimCall = { status: string; gasUsed?: string; returnData?: string; error?: { message?: string }; logs?: Array<{ address: string; topics: string[]; data: string }> }
+export type SimResult = { ok: boolean; returnData: Hex; gasUsed: bigint | null; error: string | null }
+/**
+ * The calls run in order with `balances` overriding native balances first, so a launch can be tried before its wallet
+ * holds the money. What the launcher runs before it signs: each result carries the return data (the coin's address)
+ * and the gas used (a launch close to its gas cap is one storage write from reverting). Null when no RPC can simulate.
+ */
+export async function simulateCalls(calls: SimCall[], balances: Record<string, bigint>): Promise<SimResult[] | null> {
+  const r = await simulateRaw(calls, false, balances)
+  if (!r) return null
+  if ("refused" in r) return calls.map((_, i) => ({ ok: false, returnData: "0x", gasUsed: null, error: i === 0 ? r.refused : "not reached" }))
+  return r.calls.map((c) => ({ ok: c.status === "0x1", returnData: (c.returnData ?? "0x") as Hex, gasUsed: c.gasUsed ? BigInt(c.gasUsed) : null, error: c.status === "0x1" ? null : (c.error?.message ?? "reverted").slice(0, 200) }))
+}
+
 /** One eth_simulateV1 over the read relays that have it; `refused` when the whole simulation was turned down, null when no relay has the method. */
-async function simulateRaw(calls: SimCall[], traceTransfers: boolean): Promise<{ calls: RawSimCall[] } | { refused: string } | null> {
-  const body = { jsonrpc: "2.0", id: 1, method: "eth_simulateV1", params: [{ blockStateCalls: [{ calls: calls.map((c) => ({ from: c.from, to: c.to, data: c.data, value: `0x${c.value.toString(16)}` })) }], validation: false, traceTransfers }, "latest"] }
+async function simulateRaw(calls: SimCall[], traceTransfers: boolean, balances: Record<string, bigint> = {}): Promise<{ calls: RawSimCall[] } | { refused: string } | null> {
+  const stateOverrides = Object.fromEntries(Object.entries(balances).map(([a, b]) => [a, { balance: `0x${b.toString(16)}` }]))
+  const body = { jsonrpc: "2.0", id: 1, method: "eth_simulateV1", params: [{ blockStateCalls: [{ stateOverrides, calls: calls.map((c) => ({ from: c.from, to: c.to, data: c.data, value: `0x${c.value.toString(16)}`, ...(c.gas ? { gas: `0x${c.gas.toString(16)}` } : {}) })) }], validation: false, traceTransfers }, "latest"] }
   for (const url of READ_RPCS) {
     try {
       const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(20_000) })
@@ -72,8 +85,9 @@ export async function simulateNativeReceived(calls: SimCall[], recipients: Addre
   return total
 }
 
-const DEFAULT_RPCS = ["https://rpc.agoradex.app", "https://rpc.volta.family", "https://rpc.thekleos.pro/rpc", "https://rpc-live.elysp.com"]
-const envList = (k: string) => (process.env[k] || "").split(",").map((s) => s.trim()).filter((u) => /^https:\/\//.test(u))
+const DEFAULT_RPCS = ["https://rpc.elysium.kinetiq.xyz", "https://rpc.agoradex.app", "https://rpc.volta.family", "https://rpc.thekleos.pro/rpc", "https://rpc-live.elysp.com"]
+// a browser (demo mode) has no server env: the defaults
+const envList = (k: string) => ((typeof process !== "undefined" && process.env ? process.env[k] : "") || "").split(",").map((s) => s.trim()).filter((u) => /^https:\/\//.test(u))
 
 /** Every relay a signed transaction is broadcast to. */
 export const SEND_RPCS: string[] = envList("ELYSIUM_RPC_URLS").length ? envList("ELYSIUM_RPC_URLS") : DEFAULT_RPCS
@@ -134,14 +148,32 @@ function readTransport() {
  * the process (serverState), so a module loaded twice by the bundler still shares one client and one ranker.
  */
 export function publicClient(): PublicClient {
-  return serverState("publicClient", () => createPublicClient({ chain: elysium, transport: readTransport(), pollingInterval: 200 }) as PublicClient)
+  return appState("publicClient", () => createPublicClient({ chain: elysium, transport: readTransport(), pollingInterval: 200 }) as PublicClient)
 }
 
-/** Broadcast signed bytes to every send relay at once; the hash, however it was accepted. */
+/**
+ * One read asked of every fast RPC at once; the first answer wins. Receipts use this: through the ranked fallback a
+ * third of reads stalled 4 to 5 s on a hanging relay (measured 11/7), raced they took 155 to 178 ms every time.
+ */
+export async function raceRpc<T>(method: string, params: unknown[]): Promise<T> {
+  const fast = READ_RPCS.filter((u) => !PATIENT.test(u))
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  return Promise.any((fast.length ? fast : READ_RPCS).map(async (url) => {
+    const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body, signal: AbortSignal.timeout(3_000) })
+    const j = (await r.json()) as { result?: T | null }
+    if (j.result === null || j.result === undefined) throw new Error(`${new URL(url).host}: no ${method}`)
+    return j.result
+  }))
+}
+
+/** Signed transactions from one wallet, in nonce order, sent together to every RPC at once; their hashes. */
+export function sendBatch(raws: Hex[]): Promise<Hex[]> {
+  return sendBatchTo(SEND_RPCS, raws, (hash) => raceRpc("eth_getTransactionReceipt", [hash]).then(() => true))
+}
+
+/** One signed transaction, the same way. */
 export async function sendRaw(raw: Hex): Promise<Hex> {
-  const r = await fanoutSendRaw(SEND_RPCS, raw, { onRefusal: (url, err) => console.info(`[fanout] ${new URL(url).host}: ${err.slice(0, 80)}`) })
-  console.info(`[fanout] ${r.acceptedBy ? `accepted by ${new URL(r.acceptedBy).host}` : "every relay already had it"} ${r.hash.slice(0, 12)}`)
-  return r.hash
+  return (await sendBatch([raw]))[0]
 }
 
 export const EXPLORER = "https://elyscan.live"

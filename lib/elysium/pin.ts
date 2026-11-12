@@ -3,16 +3,30 @@
  * QuickNode's IPFS (QUICKNODE_API_KEY) first, Pinata (PINATA_JWT) behind it. Server-side only.
  */
 import type { Address } from "viem"
+import { appState } from "../state"
 
 const QUICKNODE_PIN_URL = "https://api.quicknode.com/ipfs/rest/v1/s3/put-object"
 const PINATA_PIN_URL = "https://api.pinata.cloud/pinning/pinFileToIPFS"
 const EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif", "application/json": "json" }
 
-export const pinningConfigured = () => Boolean((process.env.QUICKNODE_API_KEY || "").trim() || (process.env.PINATA_JWT || "").trim())
+/** One server env value; a browser (the demo-mode engine) has none. */
+const env = (k: string): string => ((typeof process !== "undefined" && process.env ? process.env[k] : "") || "").trim()
+
+/**
+ * A pinning service handed in from outside: the browser engine of demo mode pins through the TrenchyTools API with
+ * the visitor's key (it cannot hold our provider keys). When one is set it is used for every pin; otherwise the
+ * server's own QuickNode / Pinata keys from .env.
+ */
+export type Pinner = (buf: Uint8Array, mime: string, basename: string) => Promise<{ cid: string; uri: string }>
+const slot = appState<{ pinner: Pinner | null }>("pinner", () => ({ pinner: null }))
+export function setPinner(p: Pinner | null): void { slot.pinner = p }
+
+export const pinningConfigured = () => Boolean(slot.pinner || env("QUICKNODE_API_KEY") || env("PINATA_JWT"))
 
 export async function pinBuffer(buf: Uint8Array, mime: string, basename: string): Promise<{ cid: string; uri: string }> {
+  if (slot.pinner) return slot.pinner(buf, mime, basename)
   const problems: string[] = []
-  const qn = (process.env.QUICKNODE_API_KEY || "").trim()
+  const qn = env("QUICKNODE_API_KEY")
   if (qn) {
     try {
       const objectKey = `${basename}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}.${EXT[mime] || "bin"}`
@@ -26,7 +40,7 @@ export async function pinBuffer(buf: Uint8Array, mime: string, basename: string)
       problems.push(`QuickNode: ${String(data.error ?? data.message ?? res.status)}`)
     } catch (e) { problems.push(`QuickNode: ${(e as Error).message}`) }
   }
-  const jwt = (process.env.PINATA_JWT || "").trim()
+  const jwt = env("PINATA_JWT")
   if (jwt) {
     try {
       const form = new FormData()
@@ -64,6 +78,6 @@ export async function pinMetadata(m: Metadata, image: string, creator: Address):
 /** The public gateways a pinned CID can be read from. */
 export const ipfsHttp = (uri: string) => {
   const cid = uri.replace(/^ipfs:\/\//, "")
-  const gw = (process.env.QUICKNODE_IPFS_GATEWAY || "").trim()
+  const gw = env("QUICKNODE_IPFS_GATEWAY")
   return gw ? `https://${gw.replace(/^https?:\/\//, "").replace(/\/+$/, "")}/ipfs/${cid}` : `https://gateway.pinata.cloud/ipfs/${cid}`
 }

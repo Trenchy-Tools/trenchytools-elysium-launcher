@@ -1,7 +1,7 @@
 <!-- trenchytools:header -->
 <p align="center"><img src="./.github/social.png" alt="elysium starter" width="100%"></p>
 
-<p align="center"><a href="https://trenchy.tools/docs">Docs</a> · <a href="https://github.com/Trenchy-Tools">All starters</a> · <a href="https://app.ascendlaunch.xyz">Ascend</a> · <a href="https://elyscan.io">Elyscan</a></p>
+<p align="center"><a href="https://elysium.trenchy.tools">Live demo</a> · <a href="https://trenchy.tools/docs">Docs</a> · <a href="https://github.com/Trenchy-Tools">All starters</a> · <a href="https://app.ascendlaunch.xyz">Ascend</a> · <a href="https://elyscan.io">Elyscan</a></p>
 
 # elysium starter
 
@@ -16,18 +16,18 @@ each coin's pool by itself. The same code opened on the other pads ships as
 [trenchytools-boxa-launcher](https://github.com/Trenchy-Tools/trenchytools-boxa-launcher); their READMEs walk through
 how a launch works on each.
 
-> ### Pre-mainnet build
-> Elysium has no official public RPC until its public mainnet launch, so this build **talks to the chain itself over
-> a rotating set of community relays** (Agoradex, Volta, Kleos, ElysPump): reads run over the fastest ones, every
-> signed transaction is broadcast to all of them at once and the first acceptance wins. There is no API key, no
-> account and nothing in the middle. **At the public mainnet launch the same app moves onto the
+> ### Straight to the chain
+> This build **talks to the chain itself**, through Elysium's official RPC (`https://rpc.elysium.kinetiq.xyz`) with
+> the community relays (Agoradex, Volta, Kleos, ElysPump) behind it: reads run over the fastest ones, every signed
+> transaction is broadcast to all of them at once and the first acceptance wins. There is no API key, no account and
+> nothing in the middle. **The same app can move onto the
 > [TrenchyTools API](https://trenchy.tools/docs)** (one key, the API builds and simulates every transaction, you
 > sign locally), exactly the way the pons and pump.fun starters work today, and the relay list becomes a fallback.
 > Everything else in this README stays the same.
 
 ## What each feature talks to
 
-| Feature | Today (pre-mainnet) | At the mainnet launch |
+| Feature | Today | On the TrenchyTools API |
 | --- | --- | --- |
 | Launch (`launchChecked`, dev buy, metadata suffix) | `EscrowFactory` on chain via the relays | `POST /api/ely/trade-local { action: "create" }` |
 | Buys and sells | Universal Router / the wallet's desk, calldata built in `lib/elysium/v4.ts` | `POST /api/ely/trade-local { action: "buy" \| "sell" }` |
@@ -65,7 +65,7 @@ npm run dev
 
 Open http://localhost:3000. The status dot in the top bar says whether the relays answer and whether a ★ wallet
 exists; click it for Settings. On **Wallets**, press **+ New wallet** (it becomes ★) and send it some HYPE on Elysium
-(MetaMask: chain id 99901, RPC `https://rpc.agoradex.app`, symbol HYPE). Start with small sizes and press **Dry run**
+(MetaMask: chain id 99901, RPC `https://rpc.elysium.kinetiq.xyz`, symbol HYPE). Start with small sizes and press **Dry run**
 before the first launch.
 
 ## Where your keys are
@@ -177,7 +177,20 @@ docker run -p 3000:3000 -v elysium-wallets:/data -e QUICKNODE_API_KEY=… elysiu
 ```
 
 `WALLET_BACKUP_DIR` is `/data/wallets`; mount a volume at `/data` or the wallet files vanish with the container. The
-app has no login: put it behind something that does before exposing it beyond localhost. There is no hosted demo mode
-for this starter: it signs and sends from the server, and armed exits live there.
+app has no login: put it behind something that does before exposing it beyond localhost (local mode signs and sends
+from the server, and armed exits live there).
+
+### Hosted demo mode
+
+The live demo at [elysium.trenchy.tools](https://elysium.trenchy.tools) is this app built in **demo mode**: every wallet key lives in the
+visitor's browser (localStorage, with a backup download before anything can be funded), launches, the auto-sell and timed
+sells run in the open tab, and every chain call goes from the tab straight to the public relays. The container holds no
+wallet and serves no wallet route (every `/api/*` answers 404 `demo_mode`). IPFS pins go to the TrenchyTools API with a
+key made for each visitor. To host your own:
+
+```bash
+docker build --build-arg NEXT_PUBLIC_DEMO=1 --build-arg NEXT_PUBLIC_LAUNCHPAD=ascend -t ascend-demo .
+docker run -p 3000:3000 -e DEMO_MODE=1 ascend-demo
+```
 
 MIT licensed.

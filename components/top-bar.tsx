@@ -16,7 +16,7 @@ const NAV = [
   { href: "/trading", label: "Trading" },
   { href: "/wallets", label: "Wallets" },
 ]
-const LIVE = "https://elysium.trenchy.tools"
+const LIVE = BRAND.live
 const REPO = BRAND.repo
 
 /**

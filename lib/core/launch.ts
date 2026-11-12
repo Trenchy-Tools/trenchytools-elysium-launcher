@@ -6,7 +6,8 @@
  *   1. api.rh.tradeLocal { action: "create", launchpad } → [wrap?] [approve?] create. The dev buy happens INSIDE the
  *      launch. On Ascend the dev bag lands in the dev wallet's desk when it has one; Montra and BOXA mint it to the
  *      wallet, so right after the receipt it is moved into the desk (one transfer) — the exit is then one call.
- *   2. Sign in order with the dev wallet, fan-out each; wait for the create; read the coin off its receipt.
+ *   2. Sign in order with the dev wallet and send them as one batch to every RPC (the launcher's send); a dev wallet
+ *      without a desk has its two sell approvals right behind the launch. Wait for the create; read the coin off its receipt.
  *   3. The moment it is live: every bundle wallet's buy at once (fire-and-forget through the fan-out, so they land
  *      in the next blocks). Snipers staggered `sniperGapMs`. The staggered buyers (`holders`) go one after another
  *      under `stagger` rules: a start delay, a random gap, and a GATE on outsiders' net buying over a window (below
@@ -17,14 +18,15 @@
 import { AppError } from "./errors"
 import { fundDirect, type FundResult } from "./funding"
 import { where, type Env as BaseEnv } from "./env"
-import { sendAll, waitSuccess } from "./evm"
+import { sendAll, sendTogether, waitSuccess } from "./evm"
 import { padToken, txLink } from "../links"
 import { isLaunchpad, LAUNCHPAD_NAMES, type Launchpad } from "../chain"
 import type { Built, EvmTx, Simulation, TokenMetadata } from "../elysium/api"
 import { CHAIN, type WalletInfo } from "./wallet-record"
 
 export const API_FEE_PCT = 0           // no API fee: this app talks to the chain itself
-export const GAS_RESERVE_ETH = 0.002   // a launch is ~5.2M gas (Ascend) / ~1.4–1.9M (Montra, BOXA), a buy ~0.6M, at 0.1–0.3 gwei
+export const GAS_RESERVE_ETH = 0.002   // a buyer's gas: a buy ~0.6M, at 0.1–0.3 gwei
+export const DEV_GAS_RESERVE_ETH = 0.02 // the dev's, as the launcher keeps it: the whole launch batch has to fit at the fee cap (Ascend ~7M gas); what is unspent stays in the wallet
 export const LAUNCH_FEE_ETH = 0        // none of the three charges a creation fee
 export const MAX_BUNDLE = 16
 
@@ -176,10 +178,10 @@ export function resolveWallets(env: Env, f: LaunchForm): Resolved {
 export type PlanRow = { publicKey: string; label: string; role: string; buyEth: number; needEth: number; haveEth?: number; shortEth?: number }
 export type Plan = { rows: PlanRow[]; totalEth: number; shortEth?: number; warnings: string[] }
 
-/** Per buy: HYPE + a gas reserve; the dev's launch is ~5.2M gas. */
+/** Per buy: HYPE + a gas reserve; the dev's launch batch gets its own, larger one. */
 export function fundingPlan(f: LaunchForm, r: Resolved): Plan {
   const need = (eth: number) => eth + GAS_RESERVE_ETH
-  const rows: PlanRow[] = [{ publicKey: r.dev.publicKey, label: r.dev.label, role: "dev", buyEth: f.devBuyEth, needEth: need(f.devBuyEth) + 0.002 }]
+  const rows: PlanRow[] = [{ publicKey: r.dev.publicKey, label: r.dev.label, role: "dev", buyEth: f.devBuyEth, needEth: f.devBuyEth + DEV_GAS_RESERVE_ETH }]
   for (const [role, ws] of [["bundle", r.bundle], ["sniper", r.snipers], ["holder", r.holders]] as const) for (const w of ws) rows.push({ publicKey: w.publicKey, label: w.label, role, buyEth: w.amount, needEth: need(w.amount) })
   return { rows, totalEth: rows.reduce((a, x) => a + x.needEth, 0), warnings: r.warnings }
 }
@@ -273,7 +275,7 @@ export async function execute(env: Env, record: LaunchRecord, f: LaunchForm, log
     log("create", `${built.transactions.length} transaction(s): ${built.transactions.map((t) => t.label).join(" → ")}${devReceiver.toLowerCase() !== r.dev.publicKey.toLowerCase() ? ` · dev bag to the desk ${devReceiver}` : ""}${built.predicted?.token ? ` · the coin will be ${built.predicted.token}` : ""}`)
 
     const devAccount = env.wallets.accountOf(r.dev.publicKey)
-    const hashes = await sendAll(api, devAccount, built.transactions, { confirm: false, onStep: (label, hash) => log("create", `${label} sent`, { hash, link: txLink(hash) }) })
+    const hashes = await sendTogether(api, devAccount, built.transactions, { onStep: (label, hash) => log("create", `${label} sent`, { hash, link: txLink(hash) }) })
     const createHash = hashes[built.transactions.findIndex((t) => t.label === "create")] ?? hashes[hashes.length - 1]
     record.hashes.create = createHash
     env.launches.save(record)

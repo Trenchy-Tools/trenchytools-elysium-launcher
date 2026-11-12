@@ -8,7 +8,7 @@ import type { ElysiumApi } from "../elysium/api"
 import type { Role, WalletInfo } from "./wallet-record"
 
 export type WalletStore = {
-  place: "folder"
+  place: "folder" | "browser"
   /** every usable wallet (not archived), oldest first; `role` filters by the tag */
   list(role?: Role): WalletInfo[]
   /** a usable wallet by address (any letter case), or null */

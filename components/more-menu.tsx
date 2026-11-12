@@ -13,7 +13,9 @@ const ORG = "https://github.com/Trenchy-Tools"
 const EXAMPLES = [
   { name: "pump.fun launcher", chain: "Solana", live: "https://pumpfun.trenchy.tools", repo: `${ORG}/trenchytools-pumpfun-launcher` },
   { name: "pons launcher", chain: "Robinhood Chain", live: "https://pons.trenchy.tools", repo: `${ORG}/trenchytools-pons-launcher` },
-  { name: "elysium launcher", chain: "Elysium", live: "https://elysium.trenchy.tools", repo: `${ORG}/trenchytools-elysium-launcher` },
+  { name: "elysium launcher (Ascend)", chain: "Elysium", live: "https://elysium.trenchy.tools", repo: `${ORG}/trenchytools-elysium-launcher` },
+  { name: "montra launcher", chain: "Elysium", live: "https://montra.trenchy.tools", repo: `${ORG}/trenchytools-montra-launcher` },
+  { name: "boxa launcher", chain: "Elysium", live: "https://boxa.trenchy.tools", repo: `${ORG}/trenchytools-boxa-launcher` },
   { name: "wallet mover", chain: "Solana · Robinhood · ETH · BNB", live: "https://mover.trenchy.tools", repo: `${ORG}/trenchytools-wallet-mover` },
 ]
 const ROW = "hover:bg-muted flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm"

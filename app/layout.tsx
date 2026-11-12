@@ -14,7 +14,7 @@ const mono = IBM_Plex_Mono({ subsets: ["latin"], weight: ["400", "500", "600"], 
 const DESCRIPTION = BRAND.description
 const NAME = BRAND.tag.replace("starter", "launcher")
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "https://elysium.trenchy.tools"),
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? BRAND.live),
   openGraph: { type: "website", siteName: "TrenchyTools", title: `${NAME} · TrenchyTools`, description: DESCRIPTION, images: [{ url: "/og.png", width: 1280, height: 640, alt: NAME }] },
   twitter: { card: "summary_large_image", site: "@trenchytools", title: `${NAME} · TrenchyTools`, description: DESCRIPTION, images: ["/og.png"] },
   title: { default: `${BRAND.tag} · TrenchyTools`, template: `%s · ${BRAND.tag}` },
