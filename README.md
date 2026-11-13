@@ -9,7 +9,7 @@ The official starter for launching on **Elysium** (Hyperliquid L2, chain id 9990
 [TrenchyTools API](https://api.trenchy.tools/AGENTS.md). One Next.js app, one process, one `npm run dev`. The same app as
 the pump.fun and pons starters: the same pages, the same launch flow, a different `lib/chain.ts`.
 
-**Launchpads**: Montra, Ascend, Volta and BOXA, picked on the Launch page, each with its own settings (the creator fee on Ascend, Volta and BOXA). Every one pays the creator; **Close out → Claim** collects it. Trading works on any Ascend, Montra, BOXA or Volta coin: the API detects the venue from the token. GMGN does not chart Elysium yet, so the Trading page draws the candles itself from the live trades.
+**Launchpads**: Montra, Ascend, Volta and BOXA, picked on the Launch page, each with its own settings (the creator fee on Ascend, Volta and BOXA). Every one pays the creator; **Close out → Claim** collects it. Trading works on any Ascend, Montra, BOXA or Volta coin: the API detects the venue from the token. The Trading page embeds GMGN's Elysium chart, like the other launchers.
 
 ## What it does
 

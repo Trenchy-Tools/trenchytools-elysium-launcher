@@ -140,10 +140,10 @@ export const chain: ChainConfig = {
   explorerAddress: (a) => `${ELYSCAN}/address/${a}`,
   explorerTx: (hash) => `${ELYSCAN}/tx/${hash}`,
   coinLinks: (token) => [
+    { label: "GMGN", href: `https://gmgn.ai/elysium/token/${token}`, icon: "/logos/terminals/gmgn.png" },
     { label: "Elyscan", href: `${ELYSCAN}/token/${token}`, icon: "/logos/terminals/explorer.svg" },
   ],
-  // GMGN does not chart Elysium yet: the Trading page shows the live trades and the price from them
-  chartUrl: () => null,
+  chartUrl: (token, theme) => `https://www.gmgn.cc/kline/elysium/${token}?theme=${theme}&interval=1S`,
   launchLog: {
     path: (id) => `/api/launch/${id}/events`,
     read: (e) => ({ stage: String(e.stage ?? ""), message: String(e.message ?? ""), done: e.stage === "done" || e.stage === "error", error: e.stage === "error" }),
