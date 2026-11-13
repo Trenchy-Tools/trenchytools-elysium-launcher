@@ -1,0 +1,6 @@
+node_modules
+.next
+.env
+.env.local
+# local-mode key files never leave this machine (app/wallets, the page, stays)
+/wallets

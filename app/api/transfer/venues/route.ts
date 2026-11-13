@@ -1,4 +1,13 @@
-/** There is no exchange hop on Elysium: funding is by plain transfer (POST /api/wallets/fund). */
+import { fail, ok } from "@/lib/http"
+import { trenchy } from "@/lib/settings"
+
+export const dynamic = "force-dynamic"
+
+/** GET /api/transfer/venues → GET /api/transfer/venues on the API: which exchange venues are open right now. */
 export async function GET() {
-  return Response.json({ exchange: "off", checkedAt: null, venues: {}, note: "No exchange venues on Elysium; fund wallets by plain transfer." }, { status: 200 })
+  try {
+    return ok(await trenchy().transferVenues())
+  } catch (e) {
+    return fail(e)
+  }
 }

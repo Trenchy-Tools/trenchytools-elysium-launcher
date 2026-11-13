@@ -1,80 +1,131 @@
 /**
- * Moving HYPE between the app's wallets, all refusing a wallet that is not backed up (assertBackedUp).
+ * Moving ETH between the app's wallets. Three ways, all refusing a wallet that is not backed up (assertBackedUp).
+ * Shared by local mode (lib/funding.ts) and demo mode (lib/browser/engine.ts). No node imports.
  *
- *   fundDirect   funding wallet → each wallet, a plain transfer signed with the funding wallet's account data
- *   gather       each wallet → funding wallet: balance minus a gas reserve
- *   sendDirect   each wallet → any address
+ *   fundDirect      funding wallet → each wallet, a plain `{ to, value, gas: 21000 }` signed with the funding wallet's
+ *                   account data (GET /api/rh/account once, nonce + 1 per transfer) and sent with POST /api/rh/send
+ *   fundViaExchange POST /api/transfer/batch from the funding wallet (from.chain "rh"): one exchange order per wallet;
+ *                   each leg's EVM deposit is signed and sent the same way, then POST /api/transfer/:id/sent
+ *   gather          each wallet → funding wallet: balance minus a gas reserve, one transfer per wallet
  */
 import { AppError } from "./errors"
 import { Nonces, signTx, toEth, toWei, transferGasEth, transferTx, waitSuccess } from "./evm"
 import type { Env } from "./env"
+import { isLegError, Trenchy, type TransferCreated, type TransferLegError, type TransferMode } from "../trenchy"
 import type { WalletInfo } from "./wallet-record"
+import { chain } from "../chain"
+const SYM = chain.symbol
 
 /** Left in a wallet when gathering: one plain transfer's gas at today's prices, at least this. */
-export const GATHER_RESERVE_ETH = 0.0001
+export const GATHER_RESERVE_ETH = 0.00005
 
 export type FundResult = { publicKey: string; eth: number; hash?: string; confirmed?: boolean; error?: string; code?: string }
 
 function requireFunding(env: Env): WalletInfo {
   const f = env.wallets.main()
-  if (!f) throw new AppError("No ★ wallet yet: create or import one on the Wallets page first", "no_funding_wallet", 400)
+  if (!f) throw new AppError("No dev wallet yet: create one at the top of the Launch or Wallets page first", "no_funding_wallet", 400)
   env.wallets.assertBackedUp(f.publicKey)
   return f
 }
 
-/** Funding wallet → each target. Nothing is sent when any key is not backed up or the balance is short. */
+/** Funding wallet → each target, `eth` each (or a per-target amount). Nothing is sent when any key is not backed up or the balance is short. */
 export async function fundDirect(env: Env, targets: Array<{ publicKey: string; eth: number }>): Promise<{ from: string; results: FundResult[] }> {
   const funding = requireFunding(env)
-  for (const t of targets) env.wallets.assertBackedUp(t.publicKey)
+  for (const t of targets) env.wallets.assertBackedUp(t.publicKey) // all or nothing: one missing backup refuses the whole request
   const api = env.api
   const account = env.wallets.accountOf(funding.publicKey)
-  const acct = await api.rh.account(funding.publicKey)
+  const acct = await api.evm.account(funding.publicKey) // GET /api/rh/account: nonce + fees for the whole run
   const total = targets.reduce((a, t) => a + t.eth, 0) + transferGasEth(acct) * targets.length
-  if (Number(acct.balanceEth) < total) throw new AppError(`Funding wallet holds ${acct.balanceEth} HYPE; ${total.toFixed(6)} HYPE is needed (${targets.length} transfers + gas)`, "insufficient_funds", 409, `Send HYPE to ${funding.publicKey} first`)
+  if (Number(acct.balanceEth) < total) throw new AppError(`Funding wallet holds ${acct.balanceEth} ${SYM}; ${total.toFixed(6)} ${SYM} is needed (${targets.length} transfers + gas)`, "insufficient_funds", 409, `Send ${SYM} to ${funding.publicKey} first`)
   const nonces = new Nonces(acct)
   const results: FundResult[] = []
   for (const t of targets) {
     try {
       const raw = await signTx(account, acct, nonces, transferTx(t.publicKey, t.eth, acct))
-      const { hash } = await api.rh.send(raw)
+      const { hash } = await api.evm.send(raw) // POST /api/rh/send
       results.push({ publicKey: t.publicKey, eth: t.eth, hash })
     } catch (e) {
       results.push({ publicKey: t.publicKey, eth: t.eth, error: e instanceof Error ? e.message : String(e), code: (e as { code?: string })?.code })
-      break
+      break // a failed send leaves the nonce run broken; stop here rather than guess
     }
   }
-  for (const r of results) if (r.hash) r.confirmed = await waitSuccess(api, r.hash, 60_000).catch(() => false)
+  // confirmed together: the status checks go out as one GET /api/rh/txs per poll
+  await Promise.all(results.map(async (r) => { if (r.hash) r.confirmed = await waitSuccess(api, r.hash, 60_000).catch(() => false) }))
   return { from: funding.publicKey, results }
 }
 
-/** Each wallet → the funding wallet: everything but a gas reserve. */
+export type ExchangeLeg = { publicKey: string; eth: number; transferId?: string; venue?: string; venueHonoured?: boolean; depositHash?: string; receipt?: string; status?: string; error?: string; code?: string }
+
+/** Funding wallet → each target through an exchange hop. Reduces on-chain linkability between the wallets; it is not anonymity. */
+export async function fundViaExchange(env: Env, targets: Array<{ publicKey: string; eth: number }>, mode: TransferMode = "float", venue = "random"): Promise<{ from: string; batchId?: string; legs: ExchangeLeg[] }> {
+  const funding = requireFunding(env)
+  for (const t of targets) env.wallets.assertBackedUp(t.publicKey)
+  if (targets.length > 25) throw new AppError("At most 25 wallets per exchange batch", "bad_request", 400)
+  const api = env.api
+  // POST /api/transfer/batch: one order + one unsigned deposit per wallet
+  const batch = await api.createTransferBatch({ from: { chain: chain.evm!.transferChain, wallet: funding.publicKey }, to: targets.map((t) => ({ chain: chain.evm!.transferChain, address: t.publicKey, amount: t.eth })), mode, venue })
+  const account = env.wallets.accountOf(funding.publicKey)
+  const acct = await api.evm.account(funding.publicKey)
+  const nonces = new Nonces(acct)
+  const legs: ExchangeLeg[] = []
+  for (const [i, leg] of batch.legs.entries()) {
+    const target = targets[i]
+    if (isLegError(leg as TransferLegError | TransferCreated)) { const e = leg as TransferLegError; legs.push({ publicKey: e.leg?.to?.address ?? target?.publicKey, eth: e.leg?.amount ?? target?.eth, error: e.error, code: e.code }); continue }
+    const t = leg as TransferCreated
+    const row: ExchangeLeg = { publicKey: t.to.address, eth: t.amount, transferId: t.transferId, venue: t.venue, venueHonoured: t.venueHonoured, status: t.status }
+    try {
+      const dep = Trenchy.depositTx(t, funding.publicKey) // checked: our wallet → the leg's deposit address
+      const raw = await signTx(account, acct, nonces, dep)
+      const { hash } = await api.evm.send(raw) // POST /api/rh/send
+      row.depositHash = hash
+      await api.transferSent(t.transferId, hash).catch(() => {}) // POST /api/transfer/:id/sent
+      row.status = "sent"
+    } catch (e) {
+      row.error = e instanceof Error ? e.message : String(e)
+      row.code = (e as { code?: string })?.code
+      legs.push(row)
+      break // keep the nonce run intact
+    }
+    legs.push(row)
+  }
+  return { from: funding.publicKey, batchId: batch.batchId, legs }
+}
+
+/** Each wallet → the funding wallet: everything but a gas reserve. Wallets with nothing to send are skipped. */
 export async function gather(env: Env, publicKeys: string[]): Promise<{ to: string; results: Array<FundResult & { skipped?: string }> }> {
   const funding = requireFunding(env)
   return sendDirect(env, publicKeys, funding.publicKey, "max")
 }
 
-/** Each wallet → `to`: `amount` HYPE, or "max" = the balance minus exactly the transfer's gas (+25 % margin). */
+/**
+ * Each wallet → `to` (any 0x address: ★, another wallet of the folder, or an outside address): `amount` ETH, or
+ * "max" = the whole balance minus exactly what the transfer costs (21,000 gas × maxFeePerGas, +25 % margin for a fee
+ * bump between the read and the block). Plain transfers signed by each source (GET /api/rh/account → sign →
+ * POST /api/rh/send → GET /api/rh/tx). A source that is not backed up refuses before anything is sent.
+ */
 export async function sendDirect(env: Env, publicKeys: string[], to: string, amount: number | "max"): Promise<{ to: string; results: Array<FundResult & { skipped?: string }> }> {
   for (const pk of publicKeys) env.wallets.assertBackedUp(pk)
   const api = env.api
-  const results: Array<FundResult & { skipped?: string }> = []
-  for (const pk of publicKeys) {
-    if (pk.toLowerCase() === to.toLowerCase()) { results.push({ publicKey: pk, eth: 0, skipped: "is the destination" }); continue }
+  // every source wallet at once (each has its own nonce run); the results keep the order asked
+  const results: Array<FundResult & { skipped?: string }> = new Array(publicKeys.length)
+  await Promise.all(publicKeys.map(async (pk, i) => {
+    const push = (r: FundResult & { skipped?: string }) => { results[i] = r }
+    if (pk.toLowerCase() === to.toLowerCase()) { push({ publicKey: pk, eth: 0, skipped: "is the destination" }); return }
     try {
-      const acct = await api.rh.account(pk)
-      const gasWei = BigInt(acct.transferGas || 200000) * BigInt(acct.maxFeePerGas)
+      const acct = await api.evm.account(pk) // GET /api/rh/account: balance, nonce, fees of this wallet
+      const gasWei = BigInt(acct.transferGas || 21000) * BigInt(acct.maxFeePerGas)
       const reserve = (gasWei * 125n) / 100n
       const balance = toWei(acct.balanceEth)
       const value = amount === "max" ? balance - reserve : toWei(amount)
-      if (value <= 0n) { results.push({ publicKey: pk, eth: 0, skipped: `holds ${acct.balanceEth} HYPE, not even the transfer's gas (${toEth(reserve).toFixed(8)})` }); continue }
-      if (value + reserve > balance) { results.push({ publicKey: pk, eth: 0, error: `holds ${acct.balanceEth} HYPE; ${toEth(value)} + gas ${toEth(reserve).toFixed(8)} is more than that (use Max)` }); continue }
+      if (value <= 0n) { push({ publicKey: pk, eth: 0, skipped: `holds ${acct.balanceEth} ${SYM}, not even the transfer's gas (${toEth(reserve).toFixed(8)} ${SYM})` }); return }
+      if (value + reserve > balance) { push({ publicKey: pk, eth: 0, error: `holds ${acct.balanceEth} ${SYM}; ${toEth(value)} + gas ${toEth(reserve).toFixed(8)} is more than that (use Max)` }); return }
       const raw = await signTx(env.wallets.accountOf(pk), acct, new Nonces(acct), { label: "transfer", to, data: "0x", value: value.toString(), gas: acct.transferGas })
-      const { hash } = await api.rh.send(raw)
-      results.push({ publicKey: pk, eth: toEth(value), hash })
+      const { hash } = await api.evm.send(raw) // POST /api/rh/send
+      push({ publicKey: pk, eth: toEth(value), hash })
     } catch (e) {
-      results.push({ publicKey: pk, eth: 0, error: e instanceof Error ? e.message : String(e), code: (e as { code?: string })?.code })
+      push({ publicKey: pk, eth: 0, error: e instanceof Error ? e.message : String(e), code: (e as { code?: string })?.code })
     }
-  }
-  for (const r of results) if (r.hash) r.confirmed = await waitSuccess(api, r.hash, 60_000).catch(() => false)
+  }))
+  await Promise.all(results.map(async (r) => { if (r.hash) r.confirmed = await waitSuccess(api, r.hash, 60_000).catch(() => false) }))
   return { to, results }
 }

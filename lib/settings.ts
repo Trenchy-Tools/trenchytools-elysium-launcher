@@ -1,35 +1,36 @@
 /**
- * Settings: `_app/elysium-starter/settings.json` in the wallet folder (written by the Settings sheet) over `.env`.
- *   slippage    (percent)            default 10
- *   sniperGapMs                      default 400 (gap between sniper buys after the create confirms)
- *   holderWindowS / holderDelayS     default 120 / 5 (holder buys spread over the window, after the delay)
- *   feePpm                           the pool's trade fee at launch, hundredths of a bip (10000 = 1 %)
+ * Settings: `_app/<app>-starter/settings.json` in the wallet folder (written by the Settings sheet) over `.env` defaults.
+ *   apiKey      TRENCHY_API_KEY
+ *   apiUrl      TRENCHY_API_URL      default https://api.trenchy.tools
+ *   slippage    (percent)            default 10 (the launch form carries its own sniper gap and later-buyer window)
  *   mainWallet                       the ★ wallet (0x address): pays for everything, receives gathers, default creator
- * No API key: this app talks to the chain itself (lib/elysium/chain.ts).
  */
-import { DEFAULTS } from "./core/env"
+import { DEFAULT_API_URL, DEFAULTS } from "./core/env"
 import { SETTINGS_FILE, readJson, writeJson } from "./paths"
-import { ElysiumApi } from "./elysium/api"
+import { Trenchy } from "./trenchy"
 
-export type Settings = { slippage?: number; sniperGapMs?: number; holderWindowS?: number; holderDelayS?: number; feePpm?: number; mainWallet?: string }
-const NUMS = ["slippage", "sniperGapMs", "holderWindowS", "holderDelayS", "feePpm"] as const
+export { DEFAULT_API_URL }
+
+export type Settings = { apiKey?: string; apiUrl?: string; slippage?: number; mainWallet?: string }
+const NUMS = ["slippage"] as const
 
 export function readSettings(): Settings {
   const raw = readJson<Settings>(SETTINGS_FILE, {})
   const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined)
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined)
-  const out: Settings = { mainWallet: str(raw.mainWallet) }
+  const out: Settings = { apiKey: str(raw.apiKey), apiUrl: str(raw.apiUrl), mainWallet: str(raw.mainWallet) }
   for (const k of NUMS) out[k] = num(raw[k])
   return out
 }
 
-/** A field left undefined keeps its value; null or "" clears it (back to the default). */
+/** A field left undefined keeps its value; null or "" clears it (back to the .env default). */
 export function updateSettings(patch: { [K in keyof Settings]?: Settings[K] | null }): Settings {
   const next: Settings = { ...readSettings() }
-  if (patch.mainWallet !== undefined) {
-    const v = typeof patch.mainWallet === "string" ? patch.mainWallet.trim() : ""
-    if (v) next.mainWallet = v
-    else delete next.mainWallet
+  for (const k of ["apiKey", "apiUrl", "mainWallet"] as const) {
+    if (patch[k] === undefined) continue
+    const v = typeof patch[k] === "string" ? patch[k]!.trim() : ""
+    if (v) next[k] = v
+    else delete next[k]
   }
   for (const k of NUMS) {
     if (patch[k] === undefined) continue
@@ -41,24 +42,22 @@ export function updateSettings(patch: { [K in keyof Settings]?: Settings[K] | nu
   return next
 }
 
-export type Effective = { slippage: number; sniperGapMs: number; holderWindowS: number; holderDelayS: number; feePpm: number }
+export type Effective = { apiUrl: string; apiKey: string; slippage: number; apiKeyFrom: "settings" | "env" | "none" }
 
-/** What the app actually uses: settings.json over the built-in default. */
+/** What the app actually uses: settings.json over .env over the built-in default. */
 export function effectiveSettings(): Effective {
   const s = readSettings()
+  const envKey = (process.env.TRENCHY_API_KEY || "").trim()
   return {
+    apiUrl: (s.apiUrl || process.env.TRENCHY_API_URL || DEFAULT_API_URL).trim().replace(/\/+$/, ""),
+    apiKey: s.apiKey || envKey,
     slippage: s.slippage ?? DEFAULTS.slippage,
-    sniperGapMs: s.sniperGapMs ?? DEFAULTS.sniperGapMs,
-    holderWindowS: s.holderWindowS ?? DEFAULTS.holderWindowS,
-    holderDelayS: s.holderDelayS ?? DEFAULTS.holderDelayS,
-    feePpm: s.feePpm && s.feePpm >= 10_000 && s.feePpm <= 100_000 ? s.feePpm : 10_000,
+    apiKeyFrom: s.apiKey ? "settings" : envKey ? "env" : "none",
   }
 }
 
-const one = new ElysiumApi()
-/** The chain client. One for the process. */
-export function chainApi(): ElysiumApi {
-  return one
+/** The API client with the current settings (lib/trenchy.ts, key injected). Cheap: build one per request. */
+export function trenchy(): Trenchy {
+  const { apiUrl, apiKey } = effectiveSettings()
+  return new Trenchy(apiUrl, apiKey)
 }
-/** Kept under its old name for the routes that still say it. */
-export const trenchy = chainApi

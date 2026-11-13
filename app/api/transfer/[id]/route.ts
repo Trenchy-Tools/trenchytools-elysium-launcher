@@ -1,4 +1,14 @@
-/** There is no exchange hop on Elysium. */
-export async function GET() {
-  return Response.json({ error: "No exchange transfers on Elysium", code: "not_available" }, { status: 410 })
+import { fail, ok } from "@/lib/http"
+import { trenchy } from "@/lib/settings"
+
+export const dynamic = "force-dynamic"
+
+/** GET /api/transfer/:id → GET /api/transfer/:id on the API: awaiting_deposit → exchanging → completed (payoutHash), or a failure with `help`. */
+export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
+  const { id } = await ctx.params
+  try {
+    return ok(await trenchy().transferStatus(id))
+  } catch (e) {
+    return fail(e)
+  }
 }

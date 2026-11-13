@@ -3,7 +3,7 @@ import { trenchy } from "@/lib/settings"
 
 export const dynamic = "force-dynamic"
 
-/** GET /api/trading/quote?token&action=buy|sell&amount[&wallet] → the V4 Quoter: the numbers before a trade (buys in HYPE, sells in tokens). */
+/** GET /api/trading/quote?token&action=buy|sell&amount[&wallet] → GET /api/rh/quote: the numbers before a trade (buys in ETH, sells in tokens; snipe tax depends on the wallet). */
 export async function GET(req: Request) {
   const q = new URL(req.url).searchParams
   const token = q.get("token"), wallet = q.get("wallet") ?? undefined
@@ -12,7 +12,7 @@ export async function GET(req: Request) {
   if (!isAddress(token)) return fail(new Error("token: a 0x address"), 400)
   if (!(amount > 0)) return fail(new Error("amount must be greater than zero"), 400)
   try {
-    return ok(await trenchy().rh.quote({ token, action, amount, wallet: isAddress(wallet) ? wallet : undefined }))
+    return ok(await trenchy().evm.quote({ token, action, amount, wallet: isAddress(wallet) ? wallet : undefined }))
   } catch (e) {
     return fail(e)
   }

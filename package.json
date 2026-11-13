@@ -1,9 +1,9 @@
 {
-  "name": "elysium-starter",
+  "name": "elysium-launcher",
   "version": "1.0.0",
   "private": true,
   "license": "MIT",
-  "description": "The Elysium (Hyperliquid L2) launch starter for Ascend: one Next.js app that talks to the chain itself, keys as files in the repo's wallets/ folder.",
+  "description": "The official Elysium (Hyperliquid L2) launch starter on the TrenchyTools API: Montra launches, one Next.js app, keys as files in the repo's wallets/ folder.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

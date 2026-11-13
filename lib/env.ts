@@ -1,14 +1,15 @@
 /**
- * The Env (lib/core/env.ts) of this server: the wallet folder, launches.json and the settings, with the chain client.
+ * Local mode's Env (lib/core/env.ts): the wallet folder, launches.json and the settings, with the API client built
+ * from them. The shared flows in lib/core/* run on it; the browser engine builds its own Env from localStorage
+ * (lib/browser/engine.ts).
  */
 import type { Env, LaunchRecord } from "./core/launch"
 import { LAUNCHES_FILE, readJson, writeJson } from "./paths"
-import { chainApi, effectiveSettings } from "./settings"
+import { effectiveSettings, trenchy } from "./settings"
 import { walletStore } from "./wallets"
-import { outsideNet, ownSells } from "./trading"
 
-/** launches.json in _app/elysium-starter/, newest first (at most 200). */
-export const readLaunches = (): LaunchRecord[] => readJson<LaunchRecord[]>(LAUNCHES_FILE, [])
+/** launches.json in _app/<app>-starter/, newest first (at most 200). */
+export const readLaunches = (): LaunchRecord[] => readJson<LaunchRecord[]>(LAUNCHES_FILE, []).filter((l) => typeof l?.wallets?.dev === "string") // records of the older pons starter (another shape) are left out
 export function saveLaunch(rec: LaunchRecord): void {
   const all = readLaunches().filter((l) => l.id !== rec.id)
   all.unshift(rec)
@@ -19,14 +20,9 @@ export function saveLaunch(rec: LaunchRecord): void {
 export function serverEnv(): Env {
   const s = effectiveSettings()
   return {
-    api: chainApi(),
+    api: trenchy(),
     wallets: walletStore,
     launches: { list: readLaunches, save: saveLaunch },
-    flow: { outsideNet, ownSells },
     slippage: s.slippage,
-    sniperGapMs: s.sniperGapMs,
-    holderWindowS: s.holderWindowS,
-    holderDelayS: s.holderDelayS,
-    feePpm: s.feePpm,
   }
 }

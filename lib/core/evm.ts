@@ -1,29 +1,36 @@
 /**
- * The signer. Keys are 0x hex private keys (viem `privateKeyToAccount`); the chain is Elysium (id 99901).
+ * The signer. Keys are 0x hex private keys (viem `privateKeyToAccount`); the chain is Robinhood Chain (id 4663).
+ * Shared by local mode (keys from the wallet folder, signed on the server) and demo mode (keys from the visitor's
+ * browser, signed in the tab). No node imports.
  *
- * Everything a signature needs that only the chain knows (chainId, nonce, gas) comes from `api.rh.account`
- * (lib/elysium/api.ts); the transactions come from `api.rh.tradeLocal`, or are the one plain transfer this file
- * builds. `sendAll` runs a list of them for one wallet: account read once → nonce + 1 per transaction → fan-out
- * broadcast in order → receipt. No node imports.
+ * This app never talks to an RPC node. Everything a signature needs that only the chain knows (chainId, nonce, gas
+ * prices) comes from GET /api/rh/account (lib/trenchy.ts `rh.account`); the transactions themselves come from the
+ * API (`trade-local`, transfer deposits) or are the one plain transfer this file builds: `{ to, value, gas: 21000 }`.
+ * `sendAll` runs a list of them for one wallet: account read once → nonce + 1 per transaction → POST /api/rh/send in
+ * order → GET /api/rh/tx/:hash.
  */
 import { formatEther, parseEther, type Address, type Hex } from "viem"
 import { privateKeyToAccount, generatePrivateKey, type PrivateKeyAccount } from "viem/accounts"
-import type { ElysiumApi } from "../elysium/api"
+import type { Trenchy } from "../trenchy"
 import { ApiError } from "./errors"
+import { chain } from "../chain"
 
-export const CHAIN_ID = 99901
+/** the chain's id (lib/chain.ts evm.chainId); every signature is bound to it */
+export const CHAIN_ID = chain.evm!.chainId
+/** @deprecated the old name */
+export const RH_CHAIN_ID = CHAIN_ID
 
-/** One unsigned transaction as the client hands it out. `gas` may be missing. */
+/** One unsigned transaction as the API hands it out (`trade-local` entries, transfer deposits). `gas` may be missing. */
 export type UnsignedTx = { label?: string; to: string; data?: string; value: string; gas?: string | number; from?: string; chainId?: number }
 
-/** What `api.rh.account` returns: enough to sign a run of transactions. */
+/** What GET /api/rh/account returns: enough to sign a run of transactions without an RPC node. */
 export type AccountData = {
   wallet: string; chainId: number; nonce: number; pendingNonce: number; balanceEth: string; block: number
   gasPrice: string; maxFeePerGas: string; maxPriorityFeePerGas: string; transferGas: string
 }
 
-/** Gas when the client does not say: a router swap on Elysium runs 200–600k. */
-const DEFAULT_GAS = 700_000n
+/** Gas when the API does not say: pons trades fit comfortably. */
+const DEFAULT_GAS = 600_000n
 
 export function accountFrom(privateKey: string): PrivateKeyAccount {
   return privateKeyToAccount(normalizeKey(privateKey))
@@ -41,18 +48,21 @@ export function normalizeKey(key: string): Hex {
   return hex as Hex
 }
 
-/** A nonce counter for one wallet in one batch: take `pendingNonce` once, add 1 per transaction. */
+/**
+ * A nonce counter for one wallet in one batch: take `pendingNonce` once, add 1 per transaction. Pass the same
+ * `Nonces` to every sign() of a run; a fresh one (fresh account read) after any send failure.
+ */
 export class Nonces {
   private next: number
   constructor(acct: AccountData) { this.next = acct.pendingNonce }
   take(): number { return this.next++ }
 }
 
-/** Sign one transaction with the account data: chainId + nonce + EIP-1559 fees. Returns the raw bytes. */
+/** Sign one API transaction with the account data: chainId + nonce + EIP-1559 fees. Returns the raw 0x bytes for POST /api/rh/send. */
 export async function signTx(account: PrivateKeyAccount, acct: AccountData, nonces: Nonces, tx: UnsignedTx): Promise<Hex> {
   if (tx.from && tx.from.toLowerCase() !== account.address.toLowerCase()) throw new Error(`transaction is for ${tx.from}, not ${account.address}`)
   const chainId = tx.chainId ?? acct.chainId ?? CHAIN_ID
-  if (chainId !== CHAIN_ID) throw new Error(`unexpected chainId ${chainId} (Elysium is ${CHAIN_ID})`)
+  if (chainId !== CHAIN_ID) throw new Error(`unexpected chainId ${chainId} (${chain.name} is ${CHAIN_ID})`)
   return account.signTransaction({
     type: "eip1559",
     chainId,
@@ -66,74 +76,64 @@ export async function signTx(account: PrivateKeyAccount, acct: AccountData, nonc
   })
 }
 
-/** A plain HYPE transfer, with the Orbit gas floor the account data carries. */
+/** A plain ETH transfer, as GET /api/rh/account describes it: `{ to, value, gas: 21000 }`. */
 export function transferTx(to: string, eth: number | string, acct?: AccountData): UnsignedTx {
-  return { label: "transfer", to, data: "0x", value: parseEther(String(eth) as `${number}`).toString(), gas: acct?.transferGas ?? "200000" }
+  return { label: "transfer", to, data: "0x", value: parseEther(String(eth) as `${number}`).toString(), gas: acct?.transferGas ?? "21000" }
 }
 
 export const toEth = (wei: bigint | string): number => Number(formatEther(BigInt(wei)))
 export const toWei = (eth: number | string): bigint => parseEther(String(eth) as `${number}`)
-/** The gas a plain transfer costs at the account's current maxFeePerGas, in HYPE. */
-export const transferGasEth = (acct: AccountData): number => toEth(BigInt(acct.transferGas || 200000) * BigInt(acct.maxFeePerGas))
+/** The gas a plain transfer costs at the account's current maxFeePerGas, in ETH. */
+export const transferGasEth = (acct: AccountData): number => toEth(BigInt(acct.transferGas || 21000) * BigInt(acct.maxFeePerGas))
 
 // ── a run of transactions for one wallet ────────────────────────────────────
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/** Poll the receipt until success (true), reverted (throws) or timed out (false). */
-export async function waitSuccess(api: ElysiumApi, hash: string, timeoutMs = 60_000, onProgress?: (msg: string) => void): Promise<boolean> {
+/** Poll GET /api/rh/tx/:hash until success (true), reverted (throws) or timed out (false). */
+export async function waitSuccess(api: Trenchy, hash: string, timeoutMs = 60_000, onProgress?: (msg: string) => void): Promise<boolean> {
   const start = Date.now()
   let lastNote = 0
   while (Date.now() - start < timeoutMs) {
-    const s = await api.rh.tx(hash).catch(() => null)
+    const s = await api.evm.tx(hash).catch(() => null)
     if (s?.status === "success") return true
     if (s?.status === "reverted") throw new ApiError(`Transaction reverted: ${hash}`, 502, "reverted", undefined, undefined)
     if (onProgress && Date.now() - lastNote > 4000) {
       lastNote = Date.now()
       onProgress(`Still waiting for ${hash.slice(0, 10)}… (${Math.round((Date.now() - start) / 1000)}s)`)
     }
-    await sleep(400)
+    await sleep(700)
   }
   return false
 }
 
-export type SendOptions = { confirm?: boolean; onStep?: (label: string, hash: string) => void; acct?: AccountData }
+/**
+ * `confirm`: wait for the trade itself (default true). `pipeline`: send an approve and the sell behind it back to back
+ * instead of waiting for the approve to confirm first: the nonces keep them in order and the API gives the sell a gas
+ * floor that does not need the approval to exist yet (a sell-all uses it so every wallet sells at once).
+ */
+export type SendOptions = { confirm?: boolean; pipeline?: boolean; onStep?: (label: string, hash: string) => void; acct?: AccountData }
 
 /**
- * Sign a run of transactions for one wallet and send them together as one ordered batch to every RPC, without waiting
- * between them. How a launch goes out: the wrap, the approve, the launch and the sell approvals land one after another
- * in under a second, where waiting for each receipt costs a round trip per step. The caller waits for the receipt it needs.
+ * Sign and send a run of transactions for one wallet, in order: GET /api/rh/account once, nonce + 1 per
+ * transaction, POST /api/rh/send each. An `approve` or `graduate` is confirmed (GET /api/rh/tx) before the next one
+ * goes out; the last trade is confirmed when `confirm` is true. Returns every hash, in order.
  */
-export async function sendTogether(api: ElysiumApi, account: PrivateKeyAccount, txs: UnsignedTx[], opts: SendOptions = {}): Promise<string[]> {
-  const acct = opts.acct ?? (await api.rh.account(account.address))
-  const nonces = new Nonces(acct)
-  const raws: Hex[] = []
-  for (const tx of txs) raws.push(await signTx(account, acct, nonces, tx))
-  const { hashes } = await api.rh.sendBatch(raws)
-  hashes.forEach((hash, i) => opts.onStep?.(txs[i].label ?? "tx", hash))
-  return hashes
-}
-
-/**
- * Sign and send a run of transactions for one wallet, in order: account read once, nonce + 1 per transaction,
- * fan-out broadcast each. Approvals and wraps are confirmed before the next one goes out (the sequencer refuses a
- * sell whose nonce sits behind an unmined approve); the last trade is confirmed when `confirm` is true.
- */
-export async function sendAll(api: ElysiumApi, account: PrivateKeyAccount, txs: UnsignedTx[], opts: SendOptions = {}): Promise<string[]> {
-  const acct = opts.acct ?? (await api.rh.account(account.address))
+export async function sendAll(api: Trenchy, account: PrivateKeyAccount, txs: UnsignedTx[], opts: SendOptions = {}): Promise<string[]> {
+  const acct = opts.acct ?? (await api.evm.account(account.address))
   const nonces = new Nonces(acct)
   const hashes: string[] = []
-  let main: string | null = null
+  let main: string | null = null // the trade itself (the last entry that is not the fee transfer)
   for (const tx of txs) {
     const raw = await signTx(account, acct, nonces, tx)
-    const { hash } = await api.rh.send(raw)
+    const { hash } = await api.evm.send(raw)
     hashes.push(hash)
     opts.onStep?.(tx.label ?? "tx", hash)
     if (tx.label !== "fee") main = hash
-    if (tx.label === "approve" || tx.label === "wrap") {
-      if (!(await waitSuccess(api, hash, 90_000))) throw new Error(`${tx.label} ${hash.slice(0, 10)}… not confirmed in time; check the explorer before retrying`)
+    if (tx.label === "graduate" || (tx.label === "approve" && !opts.pipeline)) {
+      if (!(await waitSuccess(api, hash, 90_000))) throw new Error(`${tx.label} ${hash.slice(0, 10)}… not confirmed in time; check GET /api/rh/tx/${hash} before retrying`)
     }
   }
-  if (opts.confirm !== false && main && !(await waitSuccess(api, main, 90_000))) throw new Error(`${main.slice(0, 10)}… not confirmed in time; check the explorer before retrying`)
+  if (opts.confirm !== false && main && !(await waitSuccess(api, main, 90_000))) throw new Error(`${main.slice(0, 10)}… not confirmed in time; check GET /api/rh/tx/${main} before retrying`)
   return hashes
 }

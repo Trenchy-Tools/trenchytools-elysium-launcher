@@ -1,5 +1,7 @@
 "use client"
 
+import { chain } from "../chain"
+import { SUITE, suiteItem } from "../suite"
 /**
  * Demo mode: the mode flag, this app's constants, and THE SEAM between the pages and whatever answers them.
  *
@@ -7,8 +9,7 @@
  *   demo mode (NEXT_PUBLIC_DEMO=1, build time)
  *                               appFetch("/api/…") is answered in the browser by lib/browser/engine.ts, which has the
  *                               same routes with the same request and response shapes, keeps the wallets in
- *                               localStorage and talks to Elysium's public relays straight from the tab (IPFS
- *                               pins go to https://api.trenchy.tools with the visitor's own key)
+ *                               localStorage and calls https://api.trenchy.tools straight from the tab
  *
  * The pages never know which one answered: lib/api.ts and lib/client.ts (the two fetch wrappers) call appFetch, and the
  * two server-sent-event streams (launch log, live trades) open through appEvents. The engine is a separate chunk, loaded
@@ -18,25 +19,24 @@
  * exports `handle(req: Request): Promise<Response>` and `stream(url: URL): EventStream | null`.
  */
 
-import { BRAND } from "../brand"
-
 // ── this app ────────────────────────────────────────────────────────────────
 
 /** Built with NEXT_PUBLIC_DEMO=1: the hosted demo. Inlined at build time, so the unused branch is dropped. */
 export const DEMO = process.env.NEXT_PUBLIC_DEMO === "1"
-/** Where visitors clone the app to run it on their own machine (this edition's repository: lib/brand.ts). */
-export const REPO_URL = BRAND.repo
-/** The TrenchyTools API: only the visitor's key and IPFS pins go there; every chain call goes to the public relays. */
-export const DEMO_API_URL = "https://api.trenchy.tools"
-/** The label of the per-visitor key: GET /api/create-api-key?label=demo-<pad> */
-export const DEMO_KEY_LABEL = `demo-${BRAND.pad}`
+/** Where visitors clone the app to run it on their own machine. */
+export const REPO_URL = suiteItem(chain.suiteId)?.repo ?? SUITE.github
+/** The API the demo talks to, straight from the browser (the CSP in next.config.ts allows exactly this host). */
+/** The API this demo calls: api.trenchy.tools, or NEXT_PUBLIC_TRENCHY_API_URL in development (a local apps/api with endpoints not deployed yet). */
+export const DEMO_API_URL = (process.env.NODE_ENV === "development" && process.env.NEXT_PUBLIC_TRENCHY_API_URL) || "https://api.trenchy.tools"
+/** The label of the per-visitor key: GET /api/create-api-key?label=demo-<suiteId> (demo-pons, demo-bnb, …) */
+export const DEMO_KEY_LABEL = `demo-${chain.suiteId}`
 /** localStorage namespace: every key this app writes starts with it. */
-export const STORE_PREFIX = "trenchytools.elysium-starter"
+export const STORE_PREFIX = `trenchytools.${chain.suiteId}-starter`
 /** What the status strip says instead of the folder path. */
 export const KEYS_HOME = "this browser"
 
 export const BANNER = "Demo mode: your wallets live in this browser only. Download your backup before funding anything. Clearing site data deletes them. We never see your keys."
-export const TAB_NOTE = "Keep this tab open: launches, the auto-sell and timed sells run in it (armed auto-sells and timed sells resume when you reopen the page)."
+export const TAB_NOTE = "Keep this tab open: timed sells and running launches run in it (timed sells resume when you reopen the page)."
 
 // ── the seam ────────────────────────────────────────────────────────────────
 

@@ -1,57 +1,51 @@
 /**
- * What the shared flows (lib/core/launch.ts, trading.ts, funding.ts) need from the outside world, as one object:
- * the chain client, the wallet folder, the launch records and the timing settings. Every store method is
- * synchronous on purpose (fs sync calls). No node imports.
+ * What the shared flows (lib/core/launch.ts, trading.ts, funding.ts) need from the outside world, as one object.
+ *
+ *   local mode  lib/wallets.ts + lib/launch.ts (files in the backup folder), key and slippage from settings.json/.env
+ *   demo mode   lib/browser/keystore.ts + the browser engine (localStorage), the visitor's own key
+ *
+ * Every store method is synchronous on purpose: both stores are (fs sync calls / localStorage), and the flows read like
+ * the server code they came from. No node imports.
  */
 import type { PrivateKeyAccount } from "viem/accounts"
-import type { ElysiumApi } from "../elysium/api"
+import type { Trenchy } from "../trenchy"
 import type { Role, WalletInfo } from "./wallet-record"
 
 export type WalletStore = {
+  /** where keys live, for messages: "folder" (local mode: "not in the folder") or "browser" ("not in this browser") */
   place: "folder" | "browser"
   /** every usable wallet (not archived), oldest first; `role` filters by the tag */
   list(role?: Role): WalletInfo[]
   /** a usable wallet by address (any letter case), or null */
   get(publicKey: string): WalletInfo | null
-  /** the ★ wallet: pays for everything, receives gathers, is the default creator */
+  /** the main wallet: pays for everything, receives gathers, is the default creator */
   main(): WalletInfo | null
   /** the backup rule: throws NotBackedUpError unless the key is safely backed up */
   assertBackedUp(publicKey: string): void
   /** the viem account that signs; throws NotBackedUpError when the wallet is unknown or not backed up */
   accountOf(publicKey: string): PrivateKeyAccount
-  /** create (and store) `count` wallets; the first wallet ever becomes ★ */
+  /** create (and store) `count` wallets; the first wallet ever becomes the main wallet. count < 1 makes none. */
   create(count: number, role?: Role, label?: string): WalletInfo[]
-}
-
-/**
- * What the staggered buys read off the coin's tape: outsiders' net buying over a window (buys − sells by wallets
- * that are not ours, our desks included as ours), and whether any of OUR wallets has sold since a moment (the
- * auto-sell fired, or the operator pressed sell: a stagger must stop buying a coin we are leaving).
- */
-export type FlowReader = {
-  outsideNet(token: string, windowMs: number): { net: number; inHype: number; outHype: number; buys: number; sells: number }
-  ownSells(token: string, sinceMs: number): number
+  /** one line for the Simulate "backup" check: where the key is kept */
+  backupNote(w: WalletInfo): string
 }
 
 export type Env<LaunchRecord = unknown> = {
-  api: ElysiumApi
+  api: Trenchy
   wallets: WalletStore
-  /** the coin's tape, for the gated buys; absent = every gate passes (and the log says so) */
-  flow?: FlowReader
   /** launch records, newest first */
   launches: { list(): LaunchRecord[]; save(rec: LaunchRecord): void }
   /** percent, the default of every trade and launch */
   slippage: number
-  /** the gap between sniper buys after the create confirms */
-  sniperGapMs: number
-  /** holder buys are spread over the window, after the delay */
-  holderWindowS: number
-  holderDelayS: number
-  /** the pool's trade fee a launch sets, hundredths of a bip */
-  feePpm: number
 }
 
-export const where = (_w: WalletStore) => "in the folder"
+/** "in the folder" / "in this browser": where a missing wallet is not. */
+export const where = (w: WalletStore) => (w.place === "folder" ? "in the folder" : "in this browser")
+/** "not in folder" / "not in this browser" (a plan row label), or with `the` for a sentence ("is not in the folder"). */
+export const notIn = (w: WalletStore, sentence = false) => (w.place === "folder" ? (sentence ? "not in the folder" : "not in folder") : "not in this browser")
 
-/** Defaults when settings.json says nothing. */
-export const DEFAULTS = { slippage: 10, sniperGapMs: 400, holderWindowS: 120, holderDelayS: 5, feePpm: 10_000 }
+/** Defaults both modes use when the visitor / settings.json / .env says nothing. */
+export const DEFAULT_API_URL = "https://api.trenchy.tools"
+export const DEFAULTS = { slippage: 10 }
+/** percent */
+export const DEFAULT_SLIPPAGE = DEFAULTS.slippage
