@@ -14,7 +14,7 @@ the pump.fun and pons starters: the same pages, the same launch flow, a differen
 ## What it does
 
 - **Launch**: name, symbol, image (or **✨ Create with AI**), socials; who buys at launch (the main wallet, another wallet
-  or a new one; bundle buyers; later buyers spread over a window; a volume maker in Calm / Normal / Wild); what happens
+  or a new one; first buyers, who buy right after the create (not in the same block); later buyers spread over a window; a volume maker in Calm / Normal / Wild); what happens
   after (auto-sell on outside money or a timer, the main wallet with the buyers, later or on its own trigger; auto-claim
   of the creator fees). A cost panel says what leaves the main wallet before anything is signed; a test run builds and
   simulates the create; the live log shows every step and hash.

@@ -72,7 +72,7 @@ export type ChainConfig = {
   maxBundle: number
   /** the tip that carries a same-block bundle ("Jito tip"), or null when the chain has none */
   tipName: string | null
-  /** one line on how bundle buyers land, for the "?" of Bundle buyers (limits, lookup tables, …) */
+  /** one line on how the first buyers land, for the "?" of First buyers */
   bundleHelp: string
   /** a vanity address suffix the launchpad uses ("pump"), or null */
   vanitySuffix: string | null
@@ -164,7 +164,7 @@ export const chain: ChainConfig = {
   minGas: 0.003,
   maxBundle: 16,
   tipName: null,
-  bundleHelp: "Elysium has a sequencer and ~0.1 s blocks, no Jito: the bundle buys all go out the moment the create confirms and usually land within a block or two.",
+  bundleHelp: "Elysium has a sequencer and ~0.1 s blocks, no Jito: the first buys all go out the moment the create confirms and usually land within a block or two.",
   vanitySuffix: null,
   evm: { api: "/api/elysium", chainId: 99901, ws: false, createVenue: "montra", exemptList: false, minBuy: 0.001, totalSupply: 1_000_000_000, transferChain: "elysium" },
   // creator fees: Montra's hook pays the coin's creator; collectCreatorFee builds the claim
